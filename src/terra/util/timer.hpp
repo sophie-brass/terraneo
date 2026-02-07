@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+#include <nesmik/nesmik.hpp>
+
 namespace terra::util {
 
 /// @brief Node representing a timed region in the hierarchy.
@@ -280,6 +282,7 @@ class Timer
     {
         TimerTree::instance().enter_scope( name );
         timer.reset();
+	nesmik::region_start( name );
         running = true;
     }
 
@@ -292,6 +295,7 @@ class Timer
         {
             double elapsed = timer.seconds();
             TimerTree::instance().exit_scope( elapsed );
+	    nesmik::region_stop( name );
             running = false;
         }
     }

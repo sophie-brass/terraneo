@@ -2,6 +2,7 @@
 #pragma once
 #include <iostream>
 #include <mpi.h>
+#include <nesmik/nesmik.hpp>
 
 namespace terra::mpi {
 
@@ -36,7 +37,10 @@ class MPIContext
     MPIContext& operator=( MPIContext&& )      = delete;
 
     /// Initialize MPI once. Safe to call only once.
-    static void initialize( int* argc, char*** argv ) { instance( argc, argv ); }
+    static void initialize( int* argc, char*** argv ) { 
+        instance( argc, argv ); 
+	nesmik::init();
+    }
 
     /// Query whether MPI is initialized
     static bool is_initialized()
@@ -84,6 +88,8 @@ class MPIContext
     {
         if ( mpi_initialized_ && !is_finalized() )
         {
+	    nesmik::finalize();
+	    MPI_Barrier(MPI_COMM_WORLD);
             int err = MPI_Finalize();
             if ( err != MPI_SUCCESS )
             {
