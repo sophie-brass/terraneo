@@ -334,6 +334,7 @@ class EpsilonDivDivKerngen
         const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
         const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
 
+        
         if ( operator_stored_matrix_mode_ != linalg::OperatorStoredMatrixMode::Off || at_cmb || at_surface )
         {
             if ( r_cell >= hex_rad_ )
@@ -550,12 +551,6 @@ class EpsilonDivDivKerngen
         {
             // ----- FAST PATH (DCA) -----
 
-            // *** Added: guard radial range required by this element (uses r and r+1) ***
-            if ( r_cell + 1 >= hex_rad_ )
-            {
-                return; // or Kokkos::abort("r_cell+1 OOB");
-            }
-
             static constexpr int WEDGE_NODE_OFF[2][6][3] = {
                 { { 0, 0, 0 }, { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 }, { 1, 0, 1 }, { 0, 1, 1 } },
                 { { 1, 1, 0 }, { 0, 1, 0 }, { 1, 0, 0 }, { 1, 1, 1 }, { 0, 1, 1 }, { 1, 0, 1 } } };
@@ -607,8 +602,6 @@ class EpsilonDivDivKerngen
             const int r_base = r_block_index * ts;
 
             auto load_level = [&]( const int level ) {
-            
-
                 const int r_abs = r_base + level;
 
                 r_sh( level ) = radii_( local_subdomain_id, r_abs );
@@ -630,8 +623,9 @@ class EpsilonDivDivKerngen
                 }
             };
 
-           // Kokkos::single( Kokkos::PerTeam( team ), [&]() {
-            if (team.team_rank() == 1) {
+            // Kokkos::single( Kokkos::PerTeam( team ), [&]() {
+            if ( team.team_rank() == 1 )
+            {
                 const double q00x = grid_( local_subdomain_id, x_cell, y_cell, 0 );
                 const double q00y = grid_( local_subdomain_id, x_cell, y_cell, 1 );
                 const double q00z = grid_( local_subdomain_id, x_cell, y_cell, 2 );
@@ -667,14 +661,21 @@ class EpsilonDivDivKerngen
                 wedge_surf_phy_coords( 1, 2, 0 ) = q10x;
                 wedge_surf_phy_coords( 1, 2, 1 ) = q10y;
                 wedge_surf_phy_coords( 1, 2, 2 ) = q10z;
+            }
+            //);
 
-                for ( int i = 0; i <= ts; ++i )
-                {
-                    load_level( i );
-                }
-            } 
-        //);
+            // each thread loads its own level
+            load_level( team.team_rank() );
 
+            // one extra level (team_size) needed for r+1 of last thread
+            if ( team.team_rank() == ts - 2 )
+            {
+                load_level( ts - 1 );
+            }
+            if ( team.team_rank() == 1 )
+            {
+                load_level( 0 );
+            }
             team.team_barrier();
 
             const int    lvl0 = team.team_rank();
@@ -747,12 +748,6 @@ class EpsilonDivDivKerngen
 
                     const double J_det = J_0_0 * J_1_1 * J_2_2 - J_0_0 * J_1_2 * J_2_1 - J_0_1 * J_1_0 * J_2_2 +
                                          J_0_1 * J_1_2 * J_2_0 + J_0_2 * J_1_0 * J_2_1 - J_0_2 * J_1_1 * J_2_0;
-
-                    // *** Added: J_det sanity check to catch inf/NaN sources early ***
-                    if ( !Kokkos::isfinite( J_det ) || Kokkos::abs( J_det ) < 1.0e-30 )
-                    {
-                        Kokkos::abort( "Bad J_det (non-finite or too small)" );
-                    }
 
                     const double invJ = 1.0 / J_det;
 
