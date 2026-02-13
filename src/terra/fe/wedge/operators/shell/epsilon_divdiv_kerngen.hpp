@@ -48,9 +48,7 @@ class EpsilonDivDivKerngen
     grid::Grid4DDataScalar< ScalarType >                     k_;
     grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag > mask_;
     BoundaryConditions                                       bcs_;
-    BoundaryConditions                                       bcs_;
-
-    bool diagonal_;
+    bool                                                     diagonal_;
 
     linalg::OperatorApplyMode         operator_apply_mode_;
     linalg::OperatorCommunicationMode operator_communication_mode_;
@@ -76,9 +74,6 @@ class EpsilonDivDivKerngen
     int blocks_per_column_;
     int blocks_;
 
-    ScalarT r_max_;
-    ScalarT r_min_;
-
   public:
     EpsilonDivDivKerngen(
         const grid::shell::DistributedDomain&                           domain,
@@ -87,7 +82,7 @@ class EpsilonDivDivKerngen
         const grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag >& mask,
         const grid::Grid4DDataScalar< ScalarT >&                        k,
         BoundaryConditions                                              bcs,
-        bool                              diagonal,
+        bool                                                            diagonal,
         linalg::OperatorApplyMode         operator_apply_mode = linalg::OperatorApplyMode::Replace,
         linalg::OperatorCommunicationMode operator_communication_mode =
             linalg::OperatorCommunicationMode::CommunicateAdditively,
@@ -117,8 +112,6 @@ class EpsilonDivDivKerngen
         block_size_                                = std::min( 256, threads_per_column );
         blocks_per_column_                         = ( threads_per_column + block_size_ - 1 ) / block_size_;
         blocks_                                    = local_subdomains_ * hex_lat_ * hex_lat_ * blocks_per_column_;
-        r_min_                                     = domain_info.radii()[0];
-        r_max_                                     = domain_info.radii()[domain_info.radii().size() - 1];
         util::logroot << "[EpsilonDivDiv] (threads_per_column, block_size_, blocks_per_column_) = "
                       << threads_per_column << ", " << block_size_ << ", " << blocks_per_column_ << ")" << std::endl;
     }
@@ -242,6 +235,8 @@ class EpsilonDivDivKerngen
         util::Timer          timer_kernel( "epsilon_divdiv_kernel" );
         Kokkos::TeamPolicy<> policy( blocks_, block_size_ );
         Kokkos::parallel_for( "matvec", policy, *this );
+        //  Kokkos::parallel_for( "matvec", grid::shell::local_domain_md_range_policy_cells( domain_ ), *this );
+
         Kokkos::fence();
         timer_kernel.stop();
 
@@ -338,41 +333,43 @@ class EpsilonDivDivKerngen
 
         const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
         const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
+
         if ( operator_stored_matrix_mode_ != linalg::OperatorStoredMatrixMode::Off || at_cmb || at_surface )
         {
+            if ( r_cell >= hex_rad_ )
+            {
+                Kokkos::abort( "This should not happen." );
+            }
+
             dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > A[num_wedges_per_hex_cell] = { 0 };
 
             if ( operator_stored_matrix_mode_ == linalg::OperatorStoredMatrixMode::Full )
             {
-                // gca on all elements, load local matrices
+                Kokkos::abort( "This should not happen." );
                 A[0] = local_matrix_storage_.get_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 0 );
                 A[1] = local_matrix_storage_.get_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 1 );
             }
             else if ( operator_stored_matrix_mode_ == linalg::OperatorStoredMatrixMode::Selective )
             {
-                // adaptive gca: check if we have a matrix stored for this element
+                Kokkos::abort( "This should not happen." );
                 if ( local_matrix_storage_.has_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 0 ) &&
                      local_matrix_storage_.has_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 1 ) )
                 {
-                    // large coefficient variation element: use stored gca matrix
                     A[0] = local_matrix_storage_.get_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 0 );
                     A[1] = local_matrix_storage_.get_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 1 );
                 }
                 else
                 {
-                    // low coefficient variation: assemble matrix on-the-fly using dca
                     A[0] = assemble_local_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 0 );
                     A[1] = assemble_local_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 1 );
                 }
             }
             else
             {
-                // boundary element: assemble matrix on-the-fly using dca
                 A[0] = assemble_local_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 0 );
                 A[1] = assemble_local_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 1 );
             }
 
-            // read source dofs
             dense::Vec< ScalarT, 18 > src[num_wedges_per_hex_cell];
             for ( int dimj = 0; dimj < 3; dimj++ )
             {
@@ -389,20 +386,16 @@ class EpsilonDivDivKerngen
                 }
             }
 
-            // Boundary treatment
             dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > boundary_mask;
             boundary_mask.fill( 1.0 );
 
-            // flag to later not go through the hustle of checking the bcs
             bool                                                  freeslip_reorder = false;
             dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > R[num_wedges_per_hex_cell];
 
             if ( at_cmb || at_surface )
             {
-                // Inner boundary (CMB).
                 ShellBoundaryFlag     sbf = at_cmb ? CMB : SURFACE;
                 BoundaryConditionFlag bcf = get_boundary_condition_flag( bcs_, sbf );
-
                 if ( bcf == DIRICHLET )
                 {
                     for ( int dimi = 0; dimi < 3; ++dimi )
@@ -413,17 +406,10 @@ class EpsilonDivDivKerngen
                             {
                                 for ( int j = 0; j < num_nodes_per_wedge; j++ )
                                 {
-                                    if ( ( at_cmb && ( ( dimi == dimj /* at diagonal eps component */ &&
-                                                         i != j /* dont kill the diag */ &&
-                                                         ( i < 3 || j < 3 /* CMB -> bc at bot layer dofs */ ) ) ||
-                                                       ( dimi != dimj /* off-diagonal eps component, kill diag too */ &&
-                                                         ( i < 3 || j < 3 ) ) ) ) ||
-                                         ( at_surface &&
-                                           ( ( dimi == dimj /* at diagonal eps component */ &&
-                                               i != j /* dont kill the diag */ &&
-                                               ( i >= 3 || j >= 3 /* SUFACE -> bc at top layer dofs */ ) ) ||
-                                             ( dimi != dimj /* off-diagonal eps component, kill diag too */ &&
-                                               ( i >= 3 || j >= 3 ) ) ) ) )
+                                    if ( ( at_cmb && ( ( dimi == dimj && i != j && ( i < 3 || j < 3 ) ) ||
+                                                       ( dimi != dimj && ( i < 3 || j < 3 ) ) ) ) ||
+                                         ( at_surface && ( ( dimi == dimj && i != j && ( i >= 3 || j >= 3 ) ) ||
+                                                           ( dimi != dimj && ( i >= 3 || j >= 3 ) ) ) ) )
                                     {
                                         boundary_mask(
                                             i + dimi * num_nodes_per_wedge, j + dimj * num_nodes_per_wedge ) = 0.0;
@@ -438,7 +424,6 @@ class EpsilonDivDivKerngen
                     freeslip_reorder                                                                     = true;
                     dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > A_tmp[num_wedges_per_hex_cell] = { 0 };
 
-                    // reorder source dofs for nodes instead of velocity dims in src vector and local matrix
                     for ( int wedge = 0; wedge < 2; ++wedge )
                     {
                         for ( int dimi = 0; dimi < 3; ++dimi )
@@ -459,16 +444,11 @@ class EpsilonDivDivKerngen
                         reorder_local_dofs( DoFOrdering::DIMENSIONWISE, DoFOrdering::NODEWISE, src[wedge] );
                     }
 
-                    // assemble rotation matrices for boundary nodes
-                    // e.g. if we are at CMB, we need to rotate DoFs 0, 1, 2 of each wedge
-                    // at SURFACE, we need to rotate DoFs 3, 4, 5
-
                     constexpr int layer_hex_offset_x[2][3] = { { 0, 1, 0 }, { 1, 0, 1 } };
                     constexpr int layer_hex_offset_y[2][3] = { { 0, 0, 1 }, { 1, 1, 0 } };
 
                     for ( int wedge = 0; wedge < 2; ++wedge )
                     {
-                        // make rotation matrix unity
                         for ( int i = 0; i < LocalMatrixDim; ++i )
                         {
                             R[wedge]( i, i ) = 1.0;
@@ -476,7 +456,6 @@ class EpsilonDivDivKerngen
 
                         for ( int boundary_node_idx = 0; boundary_node_idx < 3; boundary_node_idx++ )
                         {
-                            // compute normal
                             dense::Vec< double, 3 > normal = grid::shell::coords(
                                 local_subdomain_id,
                                 x_cell + layer_hex_offset_x[wedge][boundary_node_idx],
@@ -484,12 +463,9 @@ class EpsilonDivDivKerngen
                                 r_cell + ( at_cmb ? 0 : 1 ),
                                 grid_,
                                 radii_ );
-                          
 
-                            // compute rotation matrix for DoFs on current node
                             auto R_i = trafo_mat_cartesian_to_normal_tangential( normal );
 
-                            // insert into wedge-local rotation matrix
                             int offset_in_R = at_cmb ? 0 : 9;
                             for ( int dimi = 0; dimi < 3; ++dimi )
                             {
@@ -502,24 +478,20 @@ class EpsilonDivDivKerngen
                             }
                         }
 
-                        // transform local matrix to rotated/ normal-tangential space: pre/post multiply with rotation matrices
-                        // TODO transpose this way?
                         A[wedge] = R[wedge] * A_tmp[wedge] * R[wedge].transposed();
-                        // transform source dofs to nt-space
+
                         auto src_tmp = R[wedge] * src[wedge];
                         for ( int i = 0; i < 18; ++i )
                         {
                             src[wedge]( i ) = src_tmp( i );
                         }
 
-                        // eliminate normal components: Dirichlet on the normal-tangential system
                         int node_start = at_surface ? 3 : 0;
                         int node_end   = at_surface ? 6 : 3;
 
                         for ( int node_idx = node_start; node_idx < node_end; node_idx++ )
                         {
                             int idx = node_idx * 3;
-                            /* Eliminate rows and cols for dofs corresponding to the normal component of a velocity */
                             for ( int k = 0; k < 18; ++k )
                             {
                                 if ( k != idx )
@@ -534,7 +506,6 @@ class EpsilonDivDivKerngen
                 else if ( bcf == NEUMANN ) {}
             }
 
-            // apply boundary mask
             for ( int wedge = 0; wedge < num_wedges_per_hex_cell; wedge++ )
             {
                 A[wedge].hadamard_product( boundary_mask );
@@ -552,7 +523,6 @@ class EpsilonDivDivKerngen
 
             if ( freeslip_reorder )
             {
-                // transform dst back from nt space
                 dense::Vec< ScalarT, LocalMatrixDim > dst_tmp[num_wedges_per_hex_cell];
                 dst_tmp[0] = R[0].transposed() * dst[0];
                 dst_tmp[1] = R[1].transposed() * dst[1];
@@ -562,7 +532,6 @@ class EpsilonDivDivKerngen
                     dst[1]( i ) = dst_tmp[1]( i );
                 }
 
-                // reorder to dimensionwise ordering
                 reorder_local_dofs( DoFOrdering::NODEWISE, DoFOrdering::DIMENSIONWISE, dst[0] );
                 reorder_local_dofs( DoFOrdering::NODEWISE, DoFOrdering::DIMENSIONWISE, dst[1] );
             }
@@ -580,28 +549,26 @@ class EpsilonDivDivKerngen
         else
         {
             // ----- FAST PATH (DCA) -----
-            //   - Load ALL source dofs (and k) for the team's r-slab into TEAM SHARED MEMORY once.
-            //   - Each thread then reads the dofs for its corresponding r_cell (team_rank) from the shared arrays.
-            //
-            // Team covers radial levels: r_base ... r_base + team_size
-            // (need team_size+1 levels because each thread needs r and r+1).
+
+            // *** Added: guard radial range required by this element (uses r and r+1) ***
+            if ( r_cell + 1 >= hex_rad_ )
+            {
+                return; // or Kokkos::abort("r_cell+1 OOB");
+            }
 
             static constexpr int WEDGE_NODE_OFF[2][6][3] = {
                 { { 0, 0, 0 }, { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 }, { 1, 0, 1 }, { 0, 1, 1 } },
                 { { 1, 1, 0 }, { 0, 1, 0 }, { 1, 0, 0 }, { 1, 1, 1 }, { 0, 1, 1 }, { 1, 0, 1 } } };
 
-            // Map wedge-local node (w, node) -> unique node id in [0..7] that matches your final scatter pattern
             static constexpr int WEDGE_TO_UNIQUE[2][6] = {
                 { 0, 1, 2, 3, 4, 5 }, // wedge 0
                 { 6, 2, 1, 7, 5, 4 }  // wedge 1
             };
 
-            // ---- single quadrature point collapsed: qp0=qp1=1/3, qp2=0, qw=1 ----
             constexpr double ONE_THIRD      = 1.0 / 3.0;
             constexpr double ONE_SIXTH      = 1.0 / 6.0;
             constexpr double NEG_TWO_THIRDS = -0.66666666666666663;
 
-            // Reference gradients at qp0=qp1=1/3, qp2=0 (constexpr)
             static constexpr double dN_ref[6][3] = {
                 { -0.5, -0.5, -ONE_SIXTH },
                 { 0.5, 0.0, -ONE_SIXTH },
@@ -610,12 +577,6 @@ class EpsilonDivDivKerngen
                 { 0.5, 0.0, ONE_SIXTH },
                 { 0.0, 0.5, ONE_SIXTH } };
 
-            // ---------------------------------------------------------
-            // TEAM SCRATCH LAYOUT (UPDATED FOR BANK CONFLICTS):
-            //   wedge_surf_phy_coords: [2][3][3]
-            //   src_sh:                [4][3][team_size+1]   (xy, dim, level)   <-- level LAST (contiguous across threads)
-            //   k_sh:                  [4][team_size+1]      (xy, level)        <-- level LAST
-            //
             double* shmem =
                 reinterpret_cast< double* >( team.team_shmem().get_shmem( team_shmem_size( team.team_size() ) ) );
 
@@ -626,18 +587,15 @@ class EpsilonDivDivKerngen
             using ScratchK = Kokkos::
                 View< double**, Kokkos::LayoutRight, typename Team::scratch_memory_space, Kokkos::MemoryUnmanaged >;
 
-            // wedge coords
             ScratchCoords wedge_surf_phy_coords( shmem, 2, 3, 3 );
             shmem += 2 * 3 * 3;
 
             const int ts   = team.team_size();
             const int nlev = ts + 1;
 
-            // src_sh(xy, dim, level)
             ScratchSrc src_sh( shmem, 4, 3, nlev );
             shmem += 4 * 3 * nlev;
 
-            // k_sh(xy, level)
             ScratchK k_sh( shmem, 4, nlev );
             shmem += 4 * nlev;
 
@@ -646,64 +604,14 @@ class EpsilonDivDivKerngen
                     shmem, nlev );
             shmem += nlev;
 
-            // ---------------------------------------------------------
-            // (1) Load surface xy geometry (once per team) as before
-            // ---------------------------------------------------------
-            Kokkos::single( Kokkos::PerTeam( team ), [&]() {
-                const double q00x = grid_( local_subdomain_id, x_cell, y_cell, 0 );
-                const double q00y = grid_( local_subdomain_id, x_cell, y_cell, 1 );
-                const double q00z = grid_( local_subdomain_id, x_cell, y_cell, 2 );
-
-                const double q01x = grid_( local_subdomain_id, x_cell, y_cell + 1, 0 );
-                const double q01y = grid_( local_subdomain_id, x_cell, y_cell + 1, 1 );
-                const double q01z = grid_( local_subdomain_id, x_cell, y_cell + 1, 2 );
-
-                const double q10x = grid_( local_subdomain_id, x_cell + 1, y_cell, 0 );
-                const double q10y = grid_( local_subdomain_id, x_cell + 1, y_cell, 1 );
-                const double q10z = grid_( local_subdomain_id, x_cell + 1, y_cell, 2 );
-
-                const double q11x = grid_( local_subdomain_id, x_cell + 1, y_cell + 1, 0 );
-                const double q11y = grid_( local_subdomain_id, x_cell + 1, y_cell + 1, 1 );
-                const double q11z = grid_( local_subdomain_id, x_cell + 1, y_cell + 1, 2 );
-
-                // wedge 0: (q00,q10,q01)
-                wedge_surf_phy_coords( 0, 0, 0 ) = q00x;
-                wedge_surf_phy_coords( 0, 0, 1 ) = q00y;
-                wedge_surf_phy_coords( 0, 0, 2 ) = q00z;
-                wedge_surf_phy_coords( 0, 1, 0 ) = q10x;
-                wedge_surf_phy_coords( 0, 1, 1 ) = q10y;
-                wedge_surf_phy_coords( 0, 1, 2 ) = q10z;
-                wedge_surf_phy_coords( 0, 2, 0 ) = q01x;
-                wedge_surf_phy_coords( 0, 2, 1 ) = q01y;
-                wedge_surf_phy_coords( 0, 2, 2 ) = q01z;
-
-                // wedge 1: (q11,q01,q10)
-                wedge_surf_phy_coords( 1, 0, 0 ) = q11x;
-                wedge_surf_phy_coords( 1, 0, 1 ) = q11y;
-                wedge_surf_phy_coords( 1, 0, 2 ) = q11z;
-                wedge_surf_phy_coords( 1, 1, 0 ) = q01x;
-                wedge_surf_phy_coords( 1, 1, 1 ) = q01y;
-                wedge_surf_phy_coords( 1, 1, 2 ) = q01z;
-                wedge_surf_phy_coords( 1, 2, 0 ) = q10x;
-                wedge_surf_phy_coords( 1, 2, 1 ) = q10y;
-                wedge_surf_phy_coords( 1, 2, 2 ) = q10z;
-            } );
-
-            // ---------------------------------------------------------
-            // (2) Load ALL k/src dofs for the team's radial slab into shared memory
-            //
-            // Layout:
-            //   level = 0..team_size  (absolute r = r_base + level)
-            //   xy    = 0..3 mapped by (dx + 2*dy)
-            //
-            // Each thread loads its own level = team_rank
-            // and the last thread additionally loads level = team_size.
-            // ---------------------------------------------------------
             const int r_base = r_block_index * ts;
 
             auto load_level = [&]( const int level ) {
+            
+
                 const int r_abs = r_base + level;
-                r_sh( level )   = radii_( local_subdomain_id, r_abs );
+
+                r_sh( level ) = radii_( local_subdomain_id, r_abs );
 
                 for ( int dy = 0; dy <= 1; ++dy )
                 {
@@ -722,25 +630,57 @@ class EpsilonDivDivKerngen
                 }
             };
 
-            // each thread loads its own level
-            load_level( team.team_rank() );
+           // Kokkos::single( Kokkos::PerTeam( team ), [&]() {
+            if (team.team_rank() == 1) {
+                const double q00x = grid_( local_subdomain_id, x_cell, y_cell, 0 );
+                const double q00y = grid_( local_subdomain_id, x_cell, y_cell, 1 );
+                const double q00z = grid_( local_subdomain_id, x_cell, y_cell, 2 );
 
-            // one extra level (team_size) needed for r+1 of last thread
-            if ( team.team_rank() == ts - 1 )
-            {
-                load_level( ts );
-            }
+                const double q01x = grid_( local_subdomain_id, x_cell, y_cell + 1, 0 );
+                const double q01y = grid_( local_subdomain_id, x_cell, y_cell + 1, 1 );
+                const double q01z = grid_( local_subdomain_id, x_cell, y_cell + 1, 2 );
+
+                const double q10x = grid_( local_subdomain_id, x_cell + 1, y_cell, 0 );
+                const double q10y = grid_( local_subdomain_id, x_cell + 1, y_cell, 1 );
+                const double q10z = grid_( local_subdomain_id, x_cell + 1, y_cell, 2 );
+
+                const double q11x = grid_( local_subdomain_id, x_cell + 1, y_cell + 1, 0 );
+                const double q11y = grid_( local_subdomain_id, x_cell + 1, y_cell + 1, 1 );
+                const double q11z = grid_( local_subdomain_id, x_cell + 1, y_cell + 1, 2 );
+
+                wedge_surf_phy_coords( 0, 0, 0 ) = q00x;
+                wedge_surf_phy_coords( 0, 0, 1 ) = q00y;
+                wedge_surf_phy_coords( 0, 0, 2 ) = q00z;
+                wedge_surf_phy_coords( 0, 1, 0 ) = q10x;
+                wedge_surf_phy_coords( 0, 1, 1 ) = q10y;
+                wedge_surf_phy_coords( 0, 1, 2 ) = q10z;
+                wedge_surf_phy_coords( 0, 2, 0 ) = q01x;
+                wedge_surf_phy_coords( 0, 2, 1 ) = q01y;
+                wedge_surf_phy_coords( 0, 2, 2 ) = q01z;
+
+                wedge_surf_phy_coords( 1, 0, 0 ) = q11x;
+                wedge_surf_phy_coords( 1, 0, 1 ) = q11y;
+                wedge_surf_phy_coords( 1, 0, 2 ) = q11z;
+                wedge_surf_phy_coords( 1, 1, 0 ) = q01x;
+                wedge_surf_phy_coords( 1, 1, 1 ) = q01y;
+                wedge_surf_phy_coords( 1, 1, 2 ) = q01z;
+                wedge_surf_phy_coords( 1, 2, 0 ) = q10x;
+                wedge_surf_phy_coords( 1, 2, 1 ) = q10y;
+                wedge_surf_phy_coords( 1, 2, 2 ) = q10z;
+
+                for ( int i = 0; i <= ts; ++i )
+                {
+                    load_level( i );
+                }
+            } 
+        //);
 
             team.team_barrier();
 
-            // ---------------------------------------------------------
-            // Thread-private radii (depends on r_cell)
-            // ---------------------------------------------------------
-            const int    lvl0 = team.team_rank(); // corresponds to r_cell
+            const int    lvl0 = team.team_rank();
             const double r_0  = r_sh( lvl0 );
             const double r_1  = r_sh( lvl0 + 1 );
 
-            // Boundary treatment flags (guard the BC query)
             const bool at_boundary    = at_cmb || at_surface;
             bool       treat_boundary = false;
             if ( at_boundary )
@@ -752,16 +692,10 @@ class EpsilonDivDivKerngen
             const int cmb_shift     = ( ( at_boundary && treat_boundary && ( !diagonal_ ) && at_cmb ) ? 3 : 0 );
             const int surface_shift = ( ( at_boundary && treat_boundary && ( !diagonal_ ) && at_surface ) ? 3 : 0 );
 
-            // (1a) unique-node accumulation: 8 nodes per dim
             double dst8[3][8] = { 0.0 };
-
-            // Local level index for this thread
 
             for ( int w = 0; w < 2; ++w )
             {
-                // -------------------------
-                // (A) k_eval collapsed from shared memory
-                // -------------------------
                 double k_sum = 0.0;
 #pragma unroll
                 for ( int node = 0; node < 6; ++node )
@@ -777,9 +711,6 @@ class EpsilonDivDivKerngen
                 }
                 const double k_eval = ONE_SIXTH * k_sum;
 
-                // -------------------------
-                // (B) Jacobian + inv(J)^T
-                // -------------------------
                 double wJ = 0.0;
 
                 double i00, i01, i02;
@@ -817,9 +748,14 @@ class EpsilonDivDivKerngen
                     const double J_det = J_0_0 * J_1_1 * J_2_2 - J_0_0 * J_1_2 * J_2_1 - J_0_1 * J_1_0 * J_2_2 +
                                          J_0_1 * J_1_2 * J_2_0 + J_0_2 * J_1_0 * J_2_1 - J_0_2 * J_1_1 * J_2_0;
 
+                    // *** Added: J_det sanity check to catch inf/NaN sources early ***
+                    if ( !Kokkos::isfinite( J_det ) || Kokkos::abs( J_det ) < 1.0e-30 )
+                    {
+                        Kokkos::abort( "Bad J_det (non-finite or too small)" );
+                    }
+
                     const double invJ = 1.0 / J_det;
 
-                    // inv(J)^T
                     i00 = invJ * ( J_1_1 * J_2_2 - J_1_2 * J_2_1 );
                     i01 = invJ * ( -J_1_0 * J_2_2 + J_1_2 * J_2_0 );
                     i02 = invJ * ( J_1_0 * J_2_1 - J_1_1 * J_2_0 );
@@ -832,14 +768,11 @@ class EpsilonDivDivKerngen
                     i21 = invJ * ( -J_0_0 * J_1_2 + J_0_2 * J_1_0 );
                     i22 = invJ * ( J_0_0 * J_1_1 - J_0_1 * J_1_0 );
 
-                    wJ = Kokkos::abs( J_det ); // qw=1
+                    wJ = Kokkos::abs( J_det );
                 }
 
                 const double kwJ = k_eval * wJ;
 
-                // -------------------------
-                // (C) grad_u + div_u as scalars (src from shared memory)
-                // -------------------------
                 {
                     double gu00 = 0.0;
                     double gu10 = 0.0, gu11 = 0.0;
@@ -848,7 +781,6 @@ class EpsilonDivDivKerngen
 
                     if ( !diagonal_ )
                     {
-                        // Assemble gu** and div_u
                         for ( int dimj = 0; dimj < 3; ++dimj )
                         {
 #pragma unroll
@@ -872,7 +804,6 @@ class EpsilonDivDivKerngen
                                 const int xy  = dx + 2 * dy;
                                 const int lvl = lvl0 + dr;
 
-                                // UPDATED INDEXING: src_sh(xy, dim, level)
                                 const double s = src_sh( xy, dimj, lvl );
 
                                 gu00 += E00 * s;
@@ -886,7 +817,6 @@ class EpsilonDivDivKerngen
                             }
                         }
 
-                        // Pairing -> accumulate into unique-node array dst8
                         for ( int dimi = 0; dimi < 3; ++dimi )
                         {
 #pragma unroll
@@ -917,7 +847,6 @@ class EpsilonDivDivKerngen
                     }
                 }
 
-                // Diagonal / BC loop -> also accumulate into dst8
                 if ( diagonal_ || ( treat_boundary && at_boundary ) )
                 {
                     for ( int dim_diagBC = 0; dim_diagBC < 3; ++dim_diagBC )
@@ -943,7 +872,6 @@ class EpsilonDivDivKerngen
                             const int xy  = dx + 2 * dy;
                             const int lvl = lvl0 + dr;
 
-                            // UPDATED INDEXING: src_sh(xy, dim, level)
                             const double s = src_sh( xy, dim_diagBC, lvl );
 
                             const double pairing0 = 4.0 * s;
@@ -960,8 +888,6 @@ class EpsilonDivDivKerngen
                 }
             } // w
 
-            // Final scatter: 8 unique nodes per dim (same result as original merged scatter)
-
             for ( int dim_add = 0; dim_add < 3; ++dim_add )
             {
                 Kokkos::atomic_add( &dst_( local_subdomain_id, x_cell, y_cell, r_cell, dim_add ), dst8[dim_add][0] );
@@ -969,12 +895,14 @@ class EpsilonDivDivKerngen
                     &dst_( local_subdomain_id, x_cell + 1, y_cell, r_cell, dim_add ), dst8[dim_add][1] );
                 Kokkos::atomic_add(
                     &dst_( local_subdomain_id, x_cell, y_cell + 1, r_cell, dim_add ), dst8[dim_add][2] );
+
                 Kokkos::atomic_add(
                     &dst_( local_subdomain_id, x_cell, y_cell, r_cell + 1, dim_add ), dst8[dim_add][3] );
                 Kokkos::atomic_add(
                     &dst_( local_subdomain_id, x_cell + 1, y_cell, r_cell + 1, dim_add ), dst8[dim_add][4] );
                 Kokkos::atomic_add(
                     &dst_( local_subdomain_id, x_cell, y_cell + 1, r_cell + 1, dim_add ), dst8[dim_add][5] );
+
                 Kokkos::atomic_add(
                     &dst_( local_subdomain_id, x_cell + 1, y_cell + 1, r_cell, dim_add ), dst8[dim_add][6] );
                 Kokkos::atomic_add(
@@ -1096,11 +1024,8 @@ class EpsilonDivDivKerngen
             }
         }
 
-      
-
         return A;
     }
-
 };
 
 static_assert( linalg::GCACapable< EpsilonDivDivKerngen< float > > );
