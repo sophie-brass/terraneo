@@ -96,7 +96,7 @@ double measure_run_time( int executions, OperatorT& A, const SrcOf< OperatorT >&
 {
     Kokkos::Timer timer;
 
-    Kokkos::fence();
+    Kokkos::fence();MPI_Barrier(MPI_COMM_WORLD);
     timer.reset();
 
     for ( int i = 0; i < executions; ++i )
@@ -109,9 +109,11 @@ double measure_run_time( int executions, OperatorT& A, const SrcOf< OperatorT >&
     // Ensure stuff is not optimized out?!
     // const auto mm = kernels::common::max_abs_entry( dst.grid_data() );
     // std::cout << "Printing some derived value to ensure nothing is optimized out: " << mm << std::endl;
-
-    const double duration = timer.seconds() / executions;
-    return duration;
+    MPI_Barrier(MPI_COMM_WORLD);
+    double duration = timer.seconds() / executions;
+    double duration_max = 0.0;
+    MPI_Allreduce(&duration, &duration_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    return duration_max;
 }
 
 BenchmarkData
@@ -334,8 +336,11 @@ void run_all( const int min_level, const int max_level, const int executions, co
         table.print_pretty();
 
         // output a csv table of results
-        std::ofstream out("./csv/bo_ml" + std::to_string(max_level) + "_sdr" +  std::to_string(refinement_level_subdomains) + "_np" + std::to_string(world_size) + ".csv" );
-        table.print_csv(out);
+        if (mpi::rank() == 0) {
+            std::ofstream out("./csv/bo_ml" + std::to_string(max_level) + "_sdr" +  std::to_string(refinement_level_subdomains) + "_np" + std::to_string(world_size) + ".csv" );
+            table.print_csv(out);
+        }
+        table.print_csv(logroot);
 
         logroot << std::endl;
         logroot << std::endl;
