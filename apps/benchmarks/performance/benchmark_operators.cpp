@@ -85,9 +85,9 @@ struct BenchmarkData
 
 struct Parameters
 {
-    int min_level  = 1;
-    int max_level  = 6;
-    int executions = 5;
+    int min_level                   = 1;
+    int max_level                   = 6;
+    int executions                  = 5;
     int refinement_level_subdomains = 0;
 };
 
@@ -96,7 +96,8 @@ double measure_run_time( int executions, OperatorT& A, const SrcOf< OperatorT >&
 {
     Kokkos::Timer timer;
 
-    Kokkos::fence();MPI_Barrier(MPI_COMM_WORLD);
+    Kokkos::fence();
+    MPI_Barrier( MPI_COMM_WORLD );
     timer.reset();
 
     for ( int i = 0; i < executions; ++i )
@@ -109,10 +110,10 @@ double measure_run_time( int executions, OperatorT& A, const SrcOf< OperatorT >&
     // Ensure stuff is not optimized out?!
     // const auto mm = kernels::common::max_abs_entry( dst.grid_data() );
     // std::cout << "Printing some derived value to ensure nothing is optimized out: " << mm << std::endl;
-    MPI_Barrier(MPI_COMM_WORLD);
-    double duration = timer.seconds() / executions;
+    MPI_Barrier( MPI_COMM_WORLD );
+    double duration     = timer.seconds() / executions;
     double duration_max = 0.0;
-    MPI_Allreduce(&duration, &duration_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce( &duration, &duration_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD );
     return duration_max;
 }
 
@@ -196,7 +197,7 @@ BenchmarkData
     linalg::randomize( src_stokes_double );
     linalg::randomize( src_stokes_float );
     BoundaryConditions bcs = {
-        { CMB, DIRICHLET },
+        { CMB, FREESLIP },
         { SURFACE, DIRICHLET },
     };
     double duration = 0.0;
@@ -314,8 +315,7 @@ void run_all( const int min_level, const int max_level, const int executions, co
     logroot << "refinement for subdomains " << refinement_level_subdomains << std::endl;
     logroot << std::endl;
     int world_size = 0;
-    MPI_Comm_size(MPI_COMM_WORLD, &world_size); // total number of MPI processes
-   
+    MPI_Comm_size( MPI_COMM_WORLD, &world_size ); // total number of MPI processes
 
     for ( auto benchmark : all_benchmark_types )
     {
@@ -336,12 +336,14 @@ void run_all( const int min_level, const int max_level, const int executions, co
         table.print_pretty();
 
         // output a csv table of results
-        if (mpi::rank() == 0) {
-            std::ofstream out("./csv/bo_np" + std::to_string(world_size) + "_sdr" +  std::to_string(refinement_level_subdomains)  + "_ml" + std::to_string(max_level) + ".csv" );
-            table.print_csv(out);
+        if ( mpi::rank() == 0 )
+        {
+            std::ofstream out(
+                "./csv/bo_np" + std::to_string( world_size ) + "_sdr" + std::to_string( refinement_level_subdomains ) +
+                "_ml" + std::to_string( max_level ) + ".csv" );
+            table.print_csv( out );
         }
-        table.print_csv(logroot);
-        
+        table.print_csv( logroot );
 
         logroot << std::endl;
         logroot << std::endl;
@@ -350,7 +352,9 @@ void run_all( const int min_level, const int max_level, const int executions, co
     util::TimerTree::instance().aggregate_mpi();
     if ( mpi::rank() == 0 )
     {
-         std::ofstream out( "./tts/bo_np" + std::to_string(world_size) + "_sdr" +  std::to_string(refinement_level_subdomains)  + "_ml" + std::to_string(max_level) + ".json" );
+        std::ofstream out(
+            "./tts/bo_np" + std::to_string( world_size ) + "_sdr" + std::to_string( refinement_level_subdomains ) +
+            "_ml" + std::to_string( max_level ) + ".json" );
         out << util::TimerTree::instance().json_aggregate();
         out.close();
     }
@@ -371,7 +375,11 @@ int main( int argc, char** argv )
 
     util::add_option_with_default( app, "--min-level", parameters.min_level, "Min refinement level." );
     util::add_option_with_default( app, "--max-level", parameters.max_level, "Max refinement level." );
-    util::add_option_with_default( app, "--refinement-level-subdomains", parameters.refinement_level_subdomains, "Refinement level applied to form the subdomains." );
+    util::add_option_with_default(
+        app,
+        "--refinement-level-subdomains",
+        parameters.refinement_level_subdomains,
+        "Refinement level applied to form the subdomains." );
     util::add_option_with_default(
         app, "--executions", parameters.executions, "Number of matrix-vector multiplications to be executed." );
 
@@ -388,7 +396,8 @@ int main( int argc, char** argv )
     util::print_cli_summary( app, logroot );
     logroot << "\n\n";
 
-    run_all( parameters.min_level, parameters.max_level, parameters.executions, parameters.refinement_level_subdomains );
+    run_all(
+        parameters.min_level, parameters.max_level, parameters.executions, parameters.refinement_level_subdomains );
 
     MPI_Finalize();
 }
