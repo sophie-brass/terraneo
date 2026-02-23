@@ -31,24 +31,27 @@ using terra::linalg::trafo::trafo_mat_cartesian_to_normal_tangential;
 /**
  * @brief Matrix-free / matrix-based epsilon-div-div operator on wedge elements in a spherical shell.
  *
- * This functor supports two execution modes:
+ * This class supports three execution paths:
  *
- * 1) FAST PATH - Dirichlet/Neumann (matrix-free, no projection)
- *    - Used when no FREESLIP boundary is present and no stored matrices
- *    - Handles DIRICHLET via node-range shifts, NEUMANN naturally
- *    - This is the high-throughput path that loads a tile slab into team scratch memory
+ * 1) Slow path (local matrix path)
+ *    - Used if local matrices are stored (full or selective)
+ *    - Reuses assembled/stored 18x18 local matrices
  *
- * 2) FAST PATH - FREESLIP (matrix-free, P A P projection + normal self-coupling)
- *    - Used when FREESLIP is present on at least one boundary and no stored matrices
- *    - Enforces free-slip via per-node tangential projectors P = I - n n^T
- *    - Adds back the normal self-coupling term A_nt_nn*(n·src)*n to match the slow path
- *      for non-constraint-satisfying inputs (robust iterative convergence)
+ * 2) Fast path: Dirichlet/Neumann
+ *    - Matrix-free
+ *    - Handles Dirichlet by skipping constrained face-node couplings (and diagonal treatment if requested)
+ *    - Neumann is naturally included
  *
- * 3) SLOW PATH (local matrix path)
- *    - Used whenever local matrices are stored (full/selective)
+ * 3) Fast path: Free-slip
+ *    - Matrix-free
+ *    - Applies trial and test-side tangential projection on free-slip boundaries
+ *    - Preserves behavior consistent with the slow path for iterative solves
  *
- * The path decision is computed on the host and cached in `kernel_path_`, so the kernel
- * launch itself is specialized (we do not branch per thread/team inside the hot path).
+ * IMPORTANT DESIGN CHANGE:
+ * ------------------------
+ * The path decision is made on the HOST and cached in `kernel_path_`.
+ * `apply_impl()` dispatches to a different kernel launch per path.
+ * This avoids a runtime branch inside the hot device kernel.
  */
 template < typename ScalarT, int VecDim = 3 >
 class EpsilonDivDivKerngen
@@ -63,18 +66,18 @@ class EpsilonDivDivKerngen
     using Team                    = Kokkos::TeamPolicy<>::member_type;
 
   private:
-    // Optional storage for element-local matrices (used by GCA/coarsening or explicit local mat path)
+    // Optional element-local matrix storage (GCA/coarsening/explicit local-matrix mode)
     LocalMatrixStorage local_matrix_storage_;
 
-    // Domain and geometry / coefficient data
+    // Domain and geometry / coefficients
     grid::shell::DistributedDomain                           domain_;
-    grid::Grid3DDataVec< ScalarT, 3 >                        grid_;  // lateral shell geometry (unit sphere coords)
-    grid::Grid2DDataScalar< ScalarT >                        radii_; // radial coordinates per local subdomain
-    grid::Grid4DDataScalar< ScalarType >                     k_;     // scalar coefficient field
-    grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag > mask_;  // boundary flags per cell/node
-    BoundaryConditions                                       bcs_;   // CMB/SURFACE BC types
+    grid::Grid3DDataVec< ScalarT, 3 >                        grid_;   ///< Lateral shell geometry (unit sphere coords)
+    grid::Grid2DDataScalar< ScalarT >                        radii_;  ///< Radial coordinates per local subdomain
+    grid::Grid4DDataScalar< ScalarType >                     k_;      ///< Scalar coefficient field
+    grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag > mask_;   ///< Boundary flags per cell/node
+    BoundaryConditions                                       bcs_;    ///< CMB and SURFACE boundary conditions
 
-    bool diagonal_; // if true, apply only diagonal of local operator (or diagonalized fast approx)
+    bool diagonal_; ///< If true, apply diagonal-only action
 
     linalg::OperatorApplyMode         operator_apply_mode_;
     linalg::OperatorCommunicationMode operator_communication_mode_;
@@ -83,23 +86,22 @@ class EpsilonDivDivKerngen
     communication::shell::SubdomainNeighborhoodSendRecvBuffer< ScalarT, VecDim >                    recv_buffers_;
     terra::communication::shell::ShellBoundaryCommPlan< grid::Grid4DDataVec< ScalarType, VecDim > > comm_plan_;
 
-    // Views captured by device kernels during apply_impl
+    // Device views captured by kernels
     grid::Grid4DDataVec< ScalarType, VecDim > dst_;
     grid::Grid4DDataVec< ScalarType, VecDim > src_;
 
-    // Quadrature data (Felippa 1x1 on wedge)
+    // Quadrature (Felippa 1x1 on wedge)
     const int                num_quad_points = quadrature::quad_felippa_1x1_num_quad_points;
     dense::Vec< ScalarT, 3 > quad_points[quadrature::quad_felippa_1x1_num_quad_points];
     ScalarT                  quad_weights[quadrature::quad_felippa_1x1_num_quad_points];
 
-    // Domain extents (cells) for one local subdomain
+    // Local subdomain extents (in cells)
     int local_subdomains_;
     int hex_lat_;
     int hex_rad_;
     int lat_refinement_level_;
 
-    // 3D tile decomposition for TeamPolicy
-    // A team handles a slab: lat_tile_ x lat_tile_ x r_tile_ cells
+    // Team-policy tiling (one team handles a slab lat_tile x lat_tile x r_tile cells)
     int lat_tile_;
     int r_tile_;
     int lat_tiles_;
@@ -111,7 +113,10 @@ class EpsilonDivDivKerngen
     ScalarT r_min_;
 
     /**
-     * @brief Selects which kernel variant apply_impl launches.
+     * @brief Kernel path selected on host.
+     *
+     * This value is computed whenever BCs or stored-matrix mode change and is then
+     * used by `apply_impl()` to select which kernel launch to issue.
      */
     enum class KernelPath
     {
@@ -122,6 +127,14 @@ class EpsilonDivDivKerngen
     KernelPath kernel_path_ = KernelPath::FastDirichletNeumann;
 
   private:
+    /**
+     * @brief Recompute the kernel path on host.
+     *
+     * Rules:
+     * - Any stored local matrix mode => slow path
+     * - Else if any free-slip BC on CMB or SURFACE => fast free-slip path
+     * - Else => fast Dirichlet/Neumann path
+     */
     void update_kernel_path_flag_host_only()
     {
         const BoundaryConditionFlag cmb_bc     = get_boundary_condition_flag( bcs_, CMB );
@@ -187,6 +200,7 @@ class EpsilonDivDivKerngen
         r_min_ = domain_info.radii()[0];
         r_max_ = domain_info.radii()[domain_info.radii().size() - 1];
 
+        // Host-side path selection (no in-kernel path branching)
         update_kernel_path_flag_host_only();
 
         util::logroot << "[EpsilonDivDiv] tile size (x,y,r)=(" << lat_tile_ << "," << lat_tile_ << "," << r_tile_ << ")"
@@ -213,6 +227,8 @@ class EpsilonDivDivKerngen
     {
         bcs_[0] = bcs[0];
         bcs_[1] = bcs[1];
+
+        // Recompute host-side dispatch mode whenever BCs change
         update_kernel_path_flag_host_only();
     }
 
@@ -245,12 +261,14 @@ class EpsilonDivDivKerngen
                 domain_, operator_stored_matrix_mode_, level_range, GCAElements );
         }
 
+        // Recompute host-side dispatch mode whenever storage mode changes
         update_kernel_path_flag_host_only();
+
         util::logroot << "[EpsilonDivDiv] (set_stored_matrix_mode) kernel path = "
-                      << (( kernel_path_ == KernelPath::Slow ) ?
-            "slow" :
-        ( kernel_path_ == KernelPath::FastFreeslip ) ? "fast-freeslip" :
-                                                       "fast-dirichlet-neumann") << std::endl;
+                      << (( kernel_path_ == KernelPath::Slow ) ? "slow" :
+                          ( kernel_path_ == KernelPath::FastFreeslip ) ? "fast-freeslip" :
+                                                                         "fast-dirichlet-neumann")
+                      << std::endl;
     }
 
     linalg::OperatorStoredMatrixMode get_stored_matrix_mode() { return operator_stored_matrix_mode_; }
@@ -287,6 +305,19 @@ class EpsilonDivDivKerngen
         return assemble_local_matrix( local_subdomain_id, x_cell, y_cell, r_cell, wedge );
     }
 
+    /**
+     * @brief Apply the operator: dst <- Op(src) (or additive, depending on mode).
+     *
+     * Host-side responsibilities:
+     * - Handle replace/add mode initialization
+     * - Cache src/dst views for kernel capture
+     * - Build team policy
+     * - Dispatch to exactly one kernel variant based on `kernel_path_`
+     * - Optional halo communication accumulation
+     *
+     * This is where the path decision now lives (host), so device code does not branch
+     * on `kernel_path_` in the hot path.
+     */
     void apply_impl( const SrcVectorType& src, DstVectorType& dst )
     {
         util::Timer timer_apply( "epsilon_divdiv_apply" );
@@ -302,15 +333,34 @@ class EpsilonDivDivKerngen
         util::Timer          timer_kernel( "epsilon_divdiv_kernel" );
         Kokkos::TeamPolicy<> policy( blocks_, team_size_ );
 
+        // Fast paths use shared-memory slab staging
         if ( kernel_path_ != KernelPath::Slow )
         {
             policy.set_scratch_size( 0, Kokkos::PerTeam( team_shmem_size( team_size_ ) ) );
         }
 
-        Kokkos::parallel_for(
-            "epsilon_divdiv_apply_kernel", policy, KOKKOS_CLASS_LAMBDA( const Team& team ) {
-                this->operator()( team );
-            } );
+        // Host-side dispatch => no per-team path branching in device code
+        if ( kernel_path_ == KernelPath::Slow )
+        {
+            Kokkos::parallel_for(
+                "epsilon_divdiv_apply_kernel_slow", policy, KOKKOS_CLASS_LAMBDA( const Team& team ) {
+                    this->run_team_slow( team );
+                } );
+        }
+        else if ( kernel_path_ == KernelPath::FastFreeslip )
+        {
+            Kokkos::parallel_for(
+                "epsilon_divdiv_apply_kernel_fast_freeslip", policy, KOKKOS_CLASS_LAMBDA( const Team& team ) {
+                    this->run_team_fast_freeslip( team );
+                } );
+        }
+        else
+        {
+            Kokkos::parallel_for(
+                "epsilon_divdiv_apply_kernel_fast_dirichlet_neumann",
+                policy,
+                KOKKOS_CLASS_LAMBDA( const Team& team ) { this->run_team_fast_dirichlet_neumann( team ); } );
+        }
 
         Kokkos::fence();
         timer_kernel.stop();
@@ -322,6 +372,16 @@ class EpsilonDivDivKerngen
         }
     }
 
+    /**
+     * @brief Convert one gradient column into symmetric-gradient and div contributions.
+     *
+     * Given grad(phi e_dim), this helper computes:
+     * - diagonal entries (E00,E11,E22)
+     * - off-diagonal symmetric entries (sym01,sym02,sym12)
+     * - divergence contribution `gdd`
+     *
+     * The fast kernels use this repeatedly in fused operator application.
+     */
     KOKKOS_INLINE_FUNCTION
     void column_grad_to_sym(
         const int    dim,
@@ -361,6 +421,12 @@ class EpsilonDivDivKerngen
         }
     }
 
+    /**
+     * @brief Team scratch memory size for fast paths.
+     *
+     * Layout per team:
+     *   [coords_sh | src_sh | k_sh | r_sh | padding]
+     */
     KOKKOS_INLINE_FUNCTION
     size_t team_shmem_size( const int /*ts*/ ) const
     {
@@ -375,6 +441,12 @@ class EpsilonDivDivKerngen
     }
 
   private:
+    /**
+     * @brief Decode a team league rank / team rank into:
+     * - tile origin (x0,y0,r0)
+     * - intra-tile thread coordinates (tx,ty,tr)
+     * - target cell (x_cell,y_cell,r_cell)
+     */
     KOKKOS_INLINE_FUNCTION
     void decode_team_indices(
         const Team& team,
@@ -416,7 +488,76 @@ class EpsilonDivDivKerngen
         r_cell = r0 + tr;
     }
 
-    // ===================== SLOW PATH (unchanged except omitted comments) =====================
+    // -------------------------------------------------------------------------
+    // Path-specific team entry points (NO path branching)
+    // These are the functions called directly by host-dispatched kernel launches.
+    // -------------------------------------------------------------------------
+
+    /**
+     * @brief Team entry for slow (local-matrix) path.
+     *
+     * This wrapper performs only:
+     * - team index decoding
+     * - boundary flag queries
+     * - forwarding to operator_slow_path()
+     *
+     * No dispatch branching happens here.
+     */
+    KOKKOS_INLINE_FUNCTION
+    void run_team_slow( const Team& team ) const
+    {
+        int local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell;
+        decode_team_indices( team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell );
+
+        if ( tr >= r_tile_ )
+            return;
+
+        const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
+        const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
+
+        operator_slow_path(
+            team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
+    }
+
+    /**
+     * @brief Team entry for fast Dirichlet/Neumann matrix-free path.
+     */
+    KOKKOS_INLINE_FUNCTION
+    void run_team_fast_dirichlet_neumann( const Team& team ) const
+    {
+        int local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell;
+        decode_team_indices( team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell );
+
+        if ( tr >= r_tile_ )
+            return;
+
+        const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
+        const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
+
+        operator_fast_dirichlet_neumann_path(
+            team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
+    }
+
+    /**
+     * @brief Team entry for fast free-slip matrix-free path.
+     */
+    KOKKOS_INLINE_FUNCTION
+    void run_team_fast_freeslip( const Team& team ) const
+    {
+        int local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell;
+        decode_team_indices( team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell );
+
+        if ( tr >= r_tile_ )
+            return;
+
+        const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
+        const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
+
+        operator_fast_freeslip_path(
+            team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
+    }
+
+    // ===================== SLOW PATH =====================
     KOKKOS_INLINE_FUNCTION
     void operator_slow_path(
         const Team& team,
@@ -665,12 +806,9 @@ class EpsilonDivDivKerngen
         const bool  at_cmb,
         const bool  at_surface ) const
     {
-        // ---- scratch slab dimensions ----
         const int nlev = r_tile_ + 1;
         const int nxy  = ( lat_tile_ + 1 ) * ( lat_tile_ + 1 );
 
-        // Team scratch memory layout:
-        // [coords_sh | src_sh | k_sh | r_sh]
         double* shmem =
             reinterpret_cast< double* >( team.team_shmem().get_shmem( team_shmem_size( team.team_size() ) ) );
 
@@ -696,8 +834,6 @@ class EpsilonDivDivKerngen
 
         auto node_id = [&]( int nx, int ny ) -> int { return nx + ( lat_tile_ + 1 ) * ny; };
 
-        // ---- cooperative tile loads ----
-        // surface geometry coords
         Kokkos::parallel_for( Kokkos::TeamThreadRange( team, nxy ), [&]( int n ) {
             const int dxn = n % ( lat_tile_ + 1 );
             const int dyn = n / ( lat_tile_ + 1 );
@@ -716,13 +852,11 @@ class EpsilonDivDivKerngen
             }
         } );
 
-        // radial coordinates
         Kokkos::parallel_for( Kokkos::TeamThreadRange( team, nlev ), [&]( int lvl ) {
             const int rr = r0 + lvl;
             r_sh( lvl )  = ( rr <= hex_rad_ ) ? radii_( local_subdomain_id, rr ) : 0.0;
         } );
 
-        // coefficient and source values
         const int total_pairs = nxy * nlev;
         Kokkos::parallel_for( Kokkos::TeamThreadRange( team, total_pairs ), [&]( int t ) {
             const int lvl  = t / nxy;
@@ -751,7 +885,6 @@ class EpsilonDivDivKerngen
 
         team.team_barrier();
 
-        // Each logical thread computes one hex cell in the tile
         if ( x_cell >= hex_lat_ || y_cell >= hex_lat_ || r_cell >= hex_rad_ )
             return;
 
@@ -759,8 +892,6 @@ class EpsilonDivDivKerngen
         const double r_0  = r_sh( lvl0 );
         const double r_1  = r_sh( lvl0 + 1 );
 
-        // In the fast path we only treat DIRICHLET specially.
-        // FREESLIP is excluded by host-side dispatch.
         const bool at_boundary              = at_cmb || at_surface;
         bool       treat_boundary_dirichlet = false;
         if ( at_boundary )
@@ -769,28 +900,23 @@ class EpsilonDivDivKerngen
             treat_boundary_dirichlet    = ( get_boundary_condition_flag( bcs_, sbf ) == DIRICHLET );
         }
 
-        // For full (non-diagonal) application, skip constrained face nodes.
-        // For diagonal mode, the diagonal term can still be accumulated with boundary handling below.
         const int cmb_shift = ( ( at_boundary && treat_boundary_dirichlet && ( !diagonal_ ) && at_cmb ) ? 3 : 0 );
         const int surface_shift =
             ( ( at_boundary && treat_boundary_dirichlet && ( !diagonal_ ) && at_surface ) ? 3 : 0 );
 
-        // Wedge connectivity / local constants
         static constexpr int WEDGE_NODE_OFF[2][6][3] = {
             { { 0, 0, 0 }, { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 }, { 1, 0, 1 }, { 0, 1, 1 } },
             { { 1, 1, 0 }, { 0, 1, 0 }, { 1, 0, 0 }, { 1, 1, 1 }, { 0, 1, 1 }, { 1, 0, 1 } } };
 
-        // Map wedge-local nodes into the 8 unique hex nodes used for scatter accumulation
         static constexpr int WEDGE_TO_UNIQUE[2][6] = {
-            { 0, 1, 2, 3, 4, 5 }, // wedge 0
-            { 6, 2, 1, 7, 5, 4 }  // wedge 1
+            { 0, 1, 2, 3, 4, 5 },
+            { 6, 2, 1, 7, 5, 4 }
         };
 
         constexpr double ONE_THIRD      = 1.0 / 3.0;
         constexpr double ONE_SIXTH      = 1.0 / 6.0;
         constexpr double NEG_TWO_THIRDS = -0.66666666666666663;
 
-        // Reference gradients of wedge basis functions at the single Felippa 1x1 point
         static constexpr double dN_ref[6][3] = {
             { -0.5, -0.5, -ONE_SIXTH },
             { 0.5, 0.0, -ONE_SIXTH },
@@ -799,16 +925,13 @@ class EpsilonDivDivKerngen
             { 0.5, 0.0, ONE_SIXTH },
             { 0.0, 0.5, ONE_SIXTH } };
 
-        // Four lateral nodes of the hex footprint inside this tile
         const int n00 = node_id( tx, ty );
         const int n01 = node_id( tx, ty + 1 );
         const int n10 = node_id( tx + 1, ty );
         const int n11 = node_id( tx + 1, ty + 1 );
 
-        // Surface coordinates for the 2 wedges (3 points each)
         double ws[2][3][3];
 
-        // wedge 0: (q00,q10,q01)
         ws[0][0][0] = coords_sh( n00, 0 );
         ws[0][0][1] = coords_sh( n00, 1 );
         ws[0][0][2] = coords_sh( n00, 2 );
@@ -819,7 +942,6 @@ class EpsilonDivDivKerngen
         ws[0][2][1] = coords_sh( n01, 1 );
         ws[0][2][2] = coords_sh( n01, 2 );
 
-        // wedge 1: (q11,q01,q10)
         ws[1][0][0] = coords_sh( n11, 0 );
         ws[1][0][1] = coords_sh( n11, 1 );
         ws[1][0][2] = coords_sh( n11, 2 );
@@ -830,13 +952,10 @@ class EpsilonDivDivKerngen
         ws[1][2][1] = coords_sh( n10, 1 );
         ws[1][2][2] = coords_sh( n10, 2 );
 
-        // Per-thread accumulation into 8 hex nodes x 3 vector components.
-        // We accumulate locally in registers and atomically scatter once at the end.
         double dst8[3][8] = { 0.0 };
 
         for ( int w = 0; w < 2; ++w )
         {
-            // Coefficient k evaluated at quadrature point via average of 6 wedge nodes for 1x1 rule
             double k_sum = 0.0;
 #pragma unroll
             for ( int node = 0; node < 6; ++node )
@@ -852,7 +971,6 @@ class EpsilonDivDivKerngen
             }
             const double k_eval = ONE_SIXTH * k_sum;
 
-            // Compute inverse Jacobian and |det J| for this wedge element
             double wJ = 0.0;
             double i00, i01, i02;
             double i10, i11, i12;
@@ -894,9 +1012,6 @@ class EpsilonDivDivKerngen
 
             const double kwJ = k_eval * wJ;
 
-            // Fused operator action:
-            // - first pass builds grad(u) / div(u)-dependent accumulators
-            // - second pass tests each basis function and accumulates to dst8
             double gu00 = 0.0;
             double gu10 = 0.0, gu11 = 0.0;
             double gu20 = 0.0, gu21 = 0.0, gu22 = 0.0;
@@ -904,7 +1019,6 @@ class EpsilonDivDivKerngen
 
             if ( !diagonal_ )
             {
-                // Build sym(grad u) and div(u) at quadrature point
                 for ( int dimj = 0; dimj < 3; ++dimj )
                 {
 #pragma unroll
@@ -940,7 +1054,6 @@ class EpsilonDivDivKerngen
                     }
                 }
 
-                // Test against each basis function and accumulate local contributions
                 for ( int dimi = 0; dimi < 3; ++dimi )
                 {
 #pragma unroll
@@ -966,7 +1079,6 @@ class EpsilonDivDivKerngen
                 }
             }
 
-            // Diagonal-only mode (or diagonal correction on DIRICHLET boundaries)
             if ( diagonal_ || ( treat_boundary_dirichlet && at_boundary ) )
             {
                 for ( int dim_diagBC = 0; dim_diagBC < 3; ++dim_diagBC )
@@ -1001,9 +1113,8 @@ class EpsilonDivDivKerngen
                     }
                 }
             }
-        } // wedge loop
+        }
 
-        // Final atomic scatter to global dst vector (8 hex nodes x 3 components)
         for ( int dim_add = 0; dim_add < 3; ++dim_add )
         {
             Kokkos::atomic_add( &dst_( local_subdomain_id, x_cell, y_cell, r_cell, dim_add ), dst8[dim_add][0] );
@@ -1021,7 +1132,7 @@ class EpsilonDivDivKerngen
         }
     }
 
-    // ===================== FAST CMB-FREESLIP / SURFACE-DIRICHLET SPECIALIZED PATH =====================
+    // ===================== FAST FREESLIP PATH =====================
     KOKKOS_INLINE_FUNCTION
     void normalize3( double& x, double& y, double& z ) const
     {
@@ -1066,7 +1177,6 @@ class EpsilonDivDivKerngen
         const bool  at_cmb,
         const bool  at_surface ) const
     {
-        // ---- scratch slab dims ----
         const int nlev = r_tile_ + 1;
         const int nxy  = ( lat_tile_ + 1 ) * ( lat_tile_ + 1 );
 
@@ -1095,7 +1205,6 @@ class EpsilonDivDivKerngen
 
         auto node_id = [&]( int nx, int ny ) -> int { return nx + ( lat_tile_ + 1 ) * ny; };
 
-        // ---- cooperative slab loads ----
         Kokkos::parallel_for( Kokkos::TeamThreadRange( team, nxy ), [&]( int n ) {
             const int dxn = n % ( lat_tile_ + 1 );
             const int dyn = n / ( lat_tile_ + 1 );
@@ -1162,7 +1271,6 @@ class EpsilonDivDivKerngen
         const bool cmb_dirichlet     = at_cmb && ( cmb_bc == DIRICHLET );
         const bool surface_dirichlet = at_surface && ( surface_bc == DIRICHLET );
 
-        // same skip logic as fast DN path for Dirichlet faces
         const int cmb_shift     = ( ( cmb_dirichlet && ( !diagonal_ ) ) ? 3 : 0 );
         const int surface_shift = ( ( surface_dirichlet && ( !diagonal_ ) ) ? 3 : 0 );
 
@@ -1171,8 +1279,8 @@ class EpsilonDivDivKerngen
             { { 1, 1, 0 }, { 0, 1, 0 }, { 1, 0, 0 }, { 1, 1, 1 }, { 0, 1, 1 }, { 1, 0, 1 } } };
 
         static constexpr int WEDGE_TO_UNIQUE[2][6] = {
-            { 0, 1, 2, 3, 4, 5 }, // wedge 0
-            { 6, 2, 1, 7, 5, 4 }  // wedge 1
+            { 0, 1, 2, 3, 4, 5 },
+            { 6, 2, 1, 7, 5, 4 }
         };
 
         constexpr double ONE_THIRD      = 1.0 / 3.0;
@@ -1187,13 +1295,11 @@ class EpsilonDivDivKerngen
             { 0.5, 0.0, ONE_SIXTH },
             { 0.0, 0.5, ONE_SIXTH } };
 
-        // local footprint nodes in tile
         const int n00 = node_id( tx, ty );
         const int n01 = node_id( tx, ty + 1 );
         const int n10 = node_id( tx + 1, ty );
         const int n11 = node_id( tx + 1, ty + 1 );
 
-        // wedge surface coords in registers
         double ws[2][3][3];
 
         ws[0][0][0] = coords_sh( n00, 0 );
@@ -1216,10 +1322,8 @@ class EpsilonDivDivKerngen
         ws[1][2][1] = coords_sh( n10, 1 );
         ws[1][2][2] = coords_sh( n10, 2 );
 
-        // source cache on 8 unique hex nodes
         double src8[3][8];
 
-        // bottom face
         src8[0][0] = src_sh( n00, 0, lvl0 );
         src8[1][0] = src_sh( n00, 1, lvl0 );
         src8[2][0] = src_sh( n00, 2, lvl0 );
@@ -1233,7 +1337,6 @@ class EpsilonDivDivKerngen
         src8[1][6] = src_sh( n11, 1, lvl0 );
         src8[2][6] = src_sh( n11, 2, lvl0 );
 
-        // top face
         src8[0][3] = src_sh( n00, 0, lvl0 + 1 );
         src8[1][3] = src_sh( n00, 1, lvl0 + 1 );
         src8[2][3] = src_sh( n00, 2, lvl0 + 1 );
@@ -1247,7 +1350,6 @@ class EpsilonDivDivKerngen
         src8[1][7] = src_sh( n11, 1, lvl0 + 1 );
         src8[2][7] = src_sh( n11, 2, lvl0 + 1 );
 
-        // normals from lateral coords (radial direction)
         double nx00 = coords_sh( n00, 0 ), ny00 = coords_sh( n00, 1 ), nz00 = coords_sh( n00, 2 );
         double nx10 = coords_sh( n10, 0 ), ny10 = coords_sh( n10, 1 ), nz10 = coords_sh( n10, 2 );
         double nx01 = coords_sh( n01, 0 ), ny01 = coords_sh( n01, 1 ), nz01 = coords_sh( n01, 2 );
@@ -1258,7 +1360,6 @@ class EpsilonDivDivKerngen
         normalize3( nx01, ny01, nz01 );
         normalize3( nx11, ny11, nz11 );
 
-        // trial-side projection for freeslip faces
         if ( cmb_freeslip )
         {
             project_tangential_inplace( nx00, ny00, nz00, src8[0][0], src8[1][0], src8[2][0] );
@@ -1396,7 +1497,6 @@ class EpsilonDivDivKerngen
                 }
             }
 
-            // diagonal path and/or diagonal boundary treatment for DIRICHLET
             if ( diagonal_ || cmb_dirichlet || surface_dirichlet )
             {
                 for ( int dim_diagBC = 0; dim_diagBC < 3; ++dim_diagBC )
@@ -1424,9 +1524,9 @@ class EpsilonDivDivKerngen
                     }
                 }
             }
-        } // wedge loop
+        }
 
-        // test-side projection for freeslip faces  (P A P)
+        // Test-side projection for free-slip (P A P)
         if ( cmb_freeslip )
         {
             project_tangential_inplace( nx00, ny00, nz00, dst8[0][0], dst8[1][0], dst8[2][0] );
@@ -1442,7 +1542,6 @@ class EpsilonDivDivKerngen
             project_tangential_inplace( nx11, ny11, nz11, dst8[0][7], dst8[1][7], dst8[2][7] );
         }
 
-        // scatter
         for ( int dim_add = 0; dim_add < 3; ++dim_add )
         {
             Kokkos::atomic_add( &dst_( local_subdomain_id, x_cell, y_cell, r_cell, dim_add ), dst8[dim_add][0] );
@@ -1461,6 +1560,15 @@ class EpsilonDivDivKerngen
     }
 
   public:
+    /**
+     * @brief Legacy generic team operator.
+     *
+     * Kept for compatibility/debugging, but no longer used by apply_impl().
+     * The host now dispatches directly to path-specific kernels.
+     *
+     * This function still works, but it reintroduces a branch on `kernel_path_`
+     * and should therefore be avoided in performance-critical use.
+     */
     KOKKOS_INLINE_FUNCTION
     void operator()( const Team& team ) const
     {
@@ -1524,6 +1632,9 @@ class EpsilonDivDivKerngen
         jdet_keval_quadweight = quad_weight * k_eval * abs_det;
     }
 
+    /**
+     * @brief Assemble one wedge-local 18x18 matrix (slow path / on-demand assembly).
+     */
     KOKKOS_INLINE_FUNCTION
     dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > assemble_local_matrix(
         const int local_subdomain_id,
