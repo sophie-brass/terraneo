@@ -2,6 +2,7 @@
 
 #include "../../quadrature/quadrature.hpp"
 #include "communication/shell/communication.hpp"
+#include "communication/shell/communication_plan.hpp"
 #include "dense/vec.hpp"
 #include "fe/wedge/integrands.hpp"
 #include "fe/wedge/kernel_helpers.hpp"
@@ -27,6 +28,31 @@ using terra::grid::shell::BoundaryConditions;
 using terra::grid::shell::ShellBoundaryFlag;
 using terra::linalg::trafo::trafo_mat_cartesian_to_normal_tangential;
 
+/**
+ * @brief Matrix-free / matrix-based epsilon-div-div operator on wedge elements in a spherical shell.
+ *
+ * This class supports three execution paths:
+ *
+ * 1) Slow path (local matrix path)
+ *    - Used if local matrices are stored (full or selective)
+ *    - Reuses assembled/stored 18x18 local matrices
+ *
+ * 2) Fast path: Dirichlet/Neumann
+ *    - Matrix-free
+ *    - Handles Dirichlet by skipping constrained face-node couplings (and diagonal treatment if requested)
+ *    - Neumann is naturally included
+ *
+ * 3) Fast path: Free-slip
+ *    - Matrix-free
+ *    - Applies trial and test-side tangential projection on free-slip boundaries
+ *    - Preserves behavior consistent with the slow path for iterative solves
+ *
+ * IMPORTANT DESIGN CHANGE:
+ * ------------------------
+ * The path decision is made on the HOST and cached in `kernel_path_`.
+ * `apply_impl()` dispatches to a different kernel launch per path.
+ * This avoids a runtime branch inside the hot device kernel.
+ */
 template < typename ScalarT, int VecDim = 3 >
 class EpsilonDivDivKerngen
 {
@@ -37,35 +63,93 @@ class EpsilonDivDivKerngen
     static constexpr int LocalMatrixDim = 18;
     using Grid4DDataLocalMatrices = terra::grid::Grid4DDataMatrices< ScalarType, LocalMatrixDim, LocalMatrixDim, 2 >;
     using LocalMatrixStorage      = linalg::solvers::LocalMatrixStorage< ScalarType, LocalMatrixDim >;
+    using Team                    = Kokkos::TeamPolicy<>::member_type;
 
   private:
+    // Optional element-local matrix storage (GCA/coarsening/explicit local-matrix mode)
     LocalMatrixStorage local_matrix_storage_;
 
-    grid::shell::DistributedDomain domain_;
+    // Domain and geometry / coefficients
+    grid::shell::DistributedDomain                           domain_;
+    grid::Grid3DDataVec< ScalarT, 3 >                        grid_;   ///< Lateral shell geometry (unit sphere coords)
+    grid::Grid2DDataScalar< ScalarT >                        radii_;  ///< Radial coordinates per local subdomain
+    grid::Grid4DDataScalar< ScalarType >                     k_;      ///< Scalar coefficient field
+    grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag > mask_;   ///< Boundary flags per cell/node
+    BoundaryConditions                                       bcs_;    ///< CMB and SURFACE boundary conditions
 
-    grid::Grid3DDataVec< ScalarT, 3 >                        grid_;
-    grid::Grid2DDataScalar< ScalarT >                        radii_;
-    grid::Grid4DDataScalar< ScalarType >                     k_;
-    grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag > mask_;
-    BoundaryConditions                                       bcs_;
-
-    bool diagonal_;
+    bool diagonal_; ///< If true, apply diagonal-only action
 
     linalg::OperatorApplyMode         operator_apply_mode_;
     linalg::OperatorCommunicationMode operator_communication_mode_;
     linalg::OperatorStoredMatrixMode  operator_stored_matrix_mode_;
 
-    communication::shell::SubdomainNeighborhoodSendRecvBuffer< ScalarT, VecDim > send_buffers_;
-    communication::shell::SubdomainNeighborhoodSendRecvBuffer< ScalarT, VecDim > recv_buffers_;
+    communication::shell::SubdomainNeighborhoodSendRecvBuffer< ScalarT, VecDim >                    recv_buffers_;
+    terra::communication::shell::ShellBoundaryCommPlan< grid::Grid4DDataVec< ScalarType, VecDim > > comm_plan_;
 
-    grid::Grid4DDataVec< ScalarType, VecDim > src_;
+    // Device views captured by kernels
     grid::Grid4DDataVec< ScalarType, VecDim > dst_;
+    grid::Grid4DDataVec< ScalarType, VecDim > src_;
 
-    // Quadrature points.
-    const int num_quad_points = quadrature::quad_felippa_1x1_num_quad_points;
-
+    // Quadrature (Felippa 1x1 on wedge)
+    const int                num_quad_points = quadrature::quad_felippa_1x1_num_quad_points;
     dense::Vec< ScalarT, 3 > quad_points[quadrature::quad_felippa_1x1_num_quad_points];
     ScalarT                  quad_weights[quadrature::quad_felippa_1x1_num_quad_points];
+
+    // Local subdomain extents (in cells)
+    int local_subdomains_;
+    int hex_lat_;
+    int hex_rad_;
+    int lat_refinement_level_;
+
+    // Team-policy tiling (one team handles a slab lat_tile x lat_tile x r_tile cells)
+    int lat_tile_;
+    int r_tile_;
+    int lat_tiles_;
+    int r_tiles_;
+    int team_size_;
+    int blocks_;
+
+    ScalarT r_max_;
+    ScalarT r_min_;
+
+    /**
+     * @brief Kernel path selected on host.
+     *
+     * This value is computed whenever BCs or stored-matrix mode change and is then
+     * used by `apply_impl()` to select which kernel launch to issue.
+     */
+    enum class KernelPath
+    {
+        Slow,
+        FastDirichletNeumann,
+        FastFreeslip,
+    };
+    KernelPath kernel_path_ = KernelPath::FastDirichletNeumann;
+
+  private:
+    /**
+     * @brief Recompute the kernel path on host.
+     *
+     * Rules:
+     * - Any stored local matrix mode => slow path
+     * - Else if any free-slip BC on CMB or SURFACE => fast free-slip path
+     * - Else => fast Dirichlet/Neumann path
+     */
+    void update_kernel_path_flag_host_only()
+    {
+        const BoundaryConditionFlag cmb_bc     = get_boundary_condition_flag( bcs_, CMB );
+        const BoundaryConditionFlag surface_bc = get_boundary_condition_flag( bcs_, SURFACE );
+
+        const bool has_freeslip        = ( cmb_bc == FREESLIP ) || ( surface_bc == FREESLIP );
+        const bool has_stored_matrices = ( operator_stored_matrix_mode_ != linalg::OperatorStoredMatrixMode::Off );
+
+        if ( has_stored_matrices )
+            kernel_path_ = KernelPath::Slow;
+        else if ( has_freeslip )
+            kernel_path_ = KernelPath::FastFreeslip;
+        else
+            kernel_path_ = KernelPath::FastDirichletNeumann;
+    }
 
   public:
     EpsilonDivDivKerngen(
@@ -75,7 +159,7 @@ class EpsilonDivDivKerngen
         const grid::Grid4DDataScalar< grid::shell::ShellBoundaryFlag >& mask,
         const grid::Grid4DDataScalar< ScalarT >&                        k,
         BoundaryConditions                                              bcs,
-        bool                              diagonal,
+        bool                                                            diagonal,
         linalg::OperatorApplyMode         operator_apply_mode = linalg::OperatorApplyMode::Replace,
         linalg::OperatorCommunicationMode operator_communication_mode =
             linalg::OperatorCommunicationMode::CommunicateAdditively,
@@ -83,19 +167,50 @@ class EpsilonDivDivKerngen
     : domain_( domain )
     , grid_( grid )
     , radii_( radii )
-    , mask_( mask )
     , k_( k )
+    , mask_( mask )
     , diagonal_( diagonal )
     , operator_apply_mode_( operator_apply_mode )
     , operator_communication_mode_( operator_communication_mode )
     , operator_stored_matrix_mode_( operator_stored_matrix_mode )
-    , send_buffers_( domain )
     , recv_buffers_( domain )
+    , comm_plan_( domain )
     {
         bcs_[0] = bcs[0];
         bcs_[1] = bcs[1];
+
         quadrature::quad_felippa_1x1_quad_points( quad_points );
         quadrature::quad_felippa_1x1_quad_weights( quad_weights );
+
+        const grid::shell::DomainInfo& domain_info = domain_.domain_info();
+        local_subdomains_                          = domain_.subdomains().size();
+        hex_lat_                                   = domain_info.subdomain_num_nodes_per_side_laterally() - 1;
+        hex_rad_                                   = domain_info.subdomain_num_nodes_radially() - 1;
+        lat_refinement_level_                      = domain_info.diamond_lateral_refinement_level();
+
+        lat_tile_ = 4;
+        r_tile_   = 8;
+
+        lat_tiles_ = ( hex_lat_ + lat_tile_ - 1 ) / lat_tile_;
+        r_tiles_   = ( hex_rad_ + r_tile_ - 1 ) / r_tile_;
+
+        team_size_ = lat_tile_ * lat_tile_ * r_tile_;
+        blocks_    = local_subdomains_ * lat_tiles_ * lat_tiles_ * r_tiles_;
+
+        r_min_ = domain_info.radii()[0];
+        r_max_ = domain_info.radii()[domain_info.radii().size() - 1];
+
+        // Host-side path selection (no in-kernel path branching)
+        update_kernel_path_flag_host_only();
+
+        util::logroot << "[EpsilonDivDiv] tile size (x,y,r)=(" << lat_tile_ << "," << lat_tile_ << "," << r_tile_ << ")"
+                      << std::endl;
+        util::logroot << "[EpsilonDivDiv] number of tiles (x,y,r)=(" << lat_tiles_ << "," << lat_tiles_ << ","
+                      << r_tiles_ << "), team_size=" << team_size_ << ", blocks=" << blocks_ << std::endl;
+        const char* path_name = ( kernel_path_ == KernelPath::Slow )         ? "slow" :
+                                ( kernel_path_ == KernelPath::FastFreeslip ) ? "fast-freeslip" :
+                                                                               "fast-dirichlet-neumann";
+        util::logroot << "[EpsilonDivDiv] kernel path = " << path_name << std::endl;
     }
 
     void set_operator_apply_and_communication_modes(
@@ -106,22 +221,22 @@ class EpsilonDivDivKerngen
         operator_communication_mode_ = operator_communication_mode;
     }
 
-    /// @brief S/Getter for diagonal member
     void set_diagonal( bool v ) { diagonal_ = v; }
 
-    /// @brief Getter for coefficient
+    void set_boundary_conditions( BoundaryConditions bcs )
+    {
+        bcs_[0] = bcs[0];
+        bcs_[1] = bcs[1];
+
+        // Recompute host-side dispatch mode whenever BCs change
+        update_kernel_path_flag_host_only();
+    }
+
     const grid::Grid4DDataScalar< ScalarType >& k_grid_data() { return k_; }
+    const grid::shell::DistributedDomain&       get_domain() const { return domain_; }
+    grid::Grid2DDataScalar< ScalarT >           get_radii() const { return radii_; }
+    grid::Grid3DDataVec< ScalarT, 3 >           get_grid() { return grid_; }
 
-    /// @brief Getter for domain member
-    const grid::shell::DistributedDomain& get_domain() const { return domain_; }
-
-    /// @brief Getter for radii member
-    grid::Grid2DDataScalar< ScalarT > get_radii() const { return radii_; }
-
-    /// @brief Getter for grid member
-    grid::Grid3DDataVec< ScalarT, 3 > get_grid() { return grid_; }
-
-    /// @brief Getter for mask member
     KOKKOS_INLINE_FUNCTION
     bool has_flag(
         const int                      local_subdomain_id,
@@ -133,7 +248,6 @@ class EpsilonDivDivKerngen
         return util::has_flag( mask_( local_subdomain_id, x_cell, y_cell, r_cell ), flag );
     }
 
-    /// @brief allocates memory for the local matrices
     void set_stored_matrix_mode(
         linalg::OperatorStoredMatrixMode     operator_stored_matrix_mode,
         int                                  level_range,
@@ -141,17 +255,24 @@ class EpsilonDivDivKerngen
     {
         operator_stored_matrix_mode_ = operator_stored_matrix_mode;
 
-        // allocate storage if necessary
         if ( operator_stored_matrix_mode_ != linalg::OperatorStoredMatrixMode::Off )
         {
             local_matrix_storage_ = linalg::solvers::LocalMatrixStorage< ScalarType, LocalMatrixDim >(
                 domain_, operator_stored_matrix_mode_, level_range, GCAElements );
         }
+
+        // Recompute host-side dispatch mode whenever storage mode changes
+        update_kernel_path_flag_host_only();
+
+        util::logroot << "[EpsilonDivDiv] (set_stored_matrix_mode) kernel path = "
+                      << (( kernel_path_ == KernelPath::Slow ) ? "slow" :
+                          ( kernel_path_ == KernelPath::FastFreeslip ) ? "fast-freeslip" :
+                                                                         "fast-dirichlet-neumann")
+                      << std::endl;
     }
 
     linalg::OperatorStoredMatrixMode get_stored_matrix_mode() { return operator_stored_matrix_mode_; }
 
-    /// @brief Set the local matrix stored in the operator
     KOKKOS_INLINE_FUNCTION
     void set_local_matrix(
         const int                                                    local_subdomain_id,
@@ -165,9 +286,6 @@ class EpsilonDivDivKerngen
         local_matrix_storage_.set_matrix( local_subdomain_id, x_cell, y_cell, r_cell, wedge, mat );
     }
 
-    /// @brief Retrives the local matrix
-    /// if there is stored local matrices, the desired local matrix is loaded and returned
-    /// if not, the local matrix is assembled on-the-fly
     KOKKOS_INLINE_FUNCTION
     dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > get_local_matrix(
         const int local_subdomain_id,
@@ -176,7 +294,6 @@ class EpsilonDivDivKerngen
         const int r_cell,
         const int wedge ) const
     {
-        // request from storage
         if ( operator_stored_matrix_mode_ != linalg::OperatorStoredMatrixMode::Off )
         {
             if ( !local_matrix_storage_.has_matrix( local_subdomain_id, x_cell, y_cell, r_cell, wedge ) )
@@ -185,12 +302,22 @@ class EpsilonDivDivKerngen
             }
             return local_matrix_storage_.get_matrix( local_subdomain_id, x_cell, y_cell, r_cell, wedge );
         }
-        else
-        {
-            return assemble_local_matrix( local_subdomain_id, x_cell, y_cell, r_cell, wedge );
-        }
+        return assemble_local_matrix( local_subdomain_id, x_cell, y_cell, r_cell, wedge );
     }
 
+    /**
+     * @brief Apply the operator: dst <- Op(src) (or additive, depending on mode).
+     *
+     * Host-side responsibilities:
+     * - Handle replace/add mode initialization
+     * - Cache src/dst views for kernel capture
+     * - Build team policy
+     * - Dispatch to exactly one kernel variant based on `kernel_path_`
+     * - Optional halo communication accumulation
+     *
+     * This is where the path decision now lives (host), so device code does not branch
+     * on `kernel_path_` in the hot path.
+     */
     void apply_impl( const SrcVectorType& src, DstVectorType& dst )
     {
         util::Timer timer_apply( "epsilon_divdiv_apply" );
@@ -200,620 +327,1277 @@ class EpsilonDivDivKerngen
             assign( dst, 0 );
         }
 
-        src_ = src.grid_data();
         dst_ = dst.grid_data();
+        src_ = src.grid_data();
 
-        if ( src_.extent( 0 ) != dst_.extent( 0 ) || src_.extent( 1 ) != dst_.extent( 1 ) ||
-             src_.extent( 2 ) != dst_.extent( 2 ) || src_.extent( 3 ) != dst_.extent( 3 ) )
+        util::Timer          timer_kernel( "epsilon_divdiv_kernel" );
+        Kokkos::TeamPolicy<> policy( blocks_, team_size_ );
+
+        // Fast paths use shared-memory slab staging
+        if ( kernel_path_ != KernelPath::Slow )
         {
-            throw std::runtime_error( "EpsilonDivDiv: src/dst mismatch" );
+            policy.set_scratch_size( 0, Kokkos::PerTeam( team_shmem_size( team_size_ ) ) );
         }
 
-        if ( src_.extent( 1 ) != grid_.extent( 1 ) || src_.extent( 2 ) != grid_.extent( 2 ) )
+        // Host-side dispatch => no per-team path branching in device code
+        if ( kernel_path_ == KernelPath::Slow )
         {
-            throw std::runtime_error( "EpsilonDivDiv: src/dst mismatch" );
+            Kokkos::parallel_for(
+                "epsilon_divdiv_apply_kernel_slow", policy, KOKKOS_CLASS_LAMBDA( const Team& team ) {
+                    this->run_team_slow( team );
+                } );
+        }
+        else if ( kernel_path_ == KernelPath::FastFreeslip )
+        {
+            Kokkos::parallel_for(
+                "epsilon_divdiv_apply_kernel_fast_freeslip", policy, KOKKOS_CLASS_LAMBDA( const Team& team ) {
+                    this->run_team_fast_freeslip( team );
+                } );
+        }
+        else
+        {
+            Kokkos::parallel_for(
+                "epsilon_divdiv_apply_kernel_fast_dirichlet_neumann",
+                policy,
+                KOKKOS_CLASS_LAMBDA( const Team& team ) { this->run_team_fast_dirichlet_neumann( team ); } );
         }
 
-        util::Timer timer_kernel( "epsilon_divdiv_kernel" );
-        Kokkos::parallel_for( "matvec", grid::shell::local_domain_md_range_policy_cells( domain_ ), *this );
         Kokkos::fence();
         timer_kernel.stop();
 
         if ( operator_communication_mode_ == linalg::OperatorCommunicationMode::CommunicateAdditively )
         {
             util::Timer timer_comm( "epsilon_divdiv_comm" );
-
-            communication::shell::pack_send_and_recv_local_subdomain_boundaries(
-                domain_, dst_, send_buffers_, recv_buffers_ );
-            communication::shell::unpack_and_reduce_local_subdomain_boundaries( domain_, dst_, recv_buffers_ );
+            terra::communication::shell::send_recv_with_plan( comm_plan_, dst_, recv_buffers_ );
         }
     }
 
-    using Team = Kokkos::TeamPolicy<>::member_type;
-
-    KOKKOS_INLINE_FUNCTION void
-        operator()( const int local_subdomain_id, const int x_cell, const int y_cell, const int r_cell ) const
+    /**
+     * @brief Convert one gradient column into symmetric-gradient and div contributions.
+     *
+     * Given grad(phi e_dim), this helper computes:
+     * - diagonal entries (E00,E11,E22)
+     * - off-diagonal symmetric entries (sym01,sym02,sym12)
+     * - divergence contribution `gdd`
+     *
+     * The fast kernels use this repeatedly in fused operator application.
+     */
+    KOKKOS_INLINE_FUNCTION
+    void column_grad_to_sym(
+        const int    dim,
+        const double g0,
+        const double g1,
+        const double g2,
+        double&      E00,
+        double&      E11,
+        double&      E22,
+        double&      sym01,
+        double&      sym02,
+        double&      sym12,
+        double&      gdd ) const
     {
-        // load stored matrix/assemble local matrix explicitly if we have matrices stored (GCA)
-        // or if we are at the boundary and need to potentially apply complicated freeslip bc treatment
-        // (easier on the explicitly assembled matrix)
-        bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
-        bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
-        if ( operator_stored_matrix_mode_ != linalg::OperatorStoredMatrixMode::Off || at_cmb || at_surface )
-        {
-            dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > A[num_wedges_per_hex_cell] = { 0 };
+        E00 = E11 = E22 = sym01 = sym02 = sym12 = gdd = 0.0;
 
-            if ( operator_stored_matrix_mode_ == linalg::OperatorStoredMatrixMode::Full )
+        switch ( dim )
+        {
+        case 0:
+            E00   = g0;
+            gdd   = g0;
+            sym01 = 0.5 * g1;
+            sym02 = 0.5 * g2;
+            break;
+        case 1:
+            E11   = g1;
+            gdd   = g1;
+            sym01 = 0.5 * g0;
+            sym12 = 0.5 * g2;
+            break;
+        default:
+            E22   = g2;
+            gdd   = g2;
+            sym02 = 0.5 * g0;
+            sym12 = 0.5 * g1;
+            break;
+        }
+    }
+
+    /**
+     * @brief Team scratch memory size for fast paths.
+     *
+     * Layout per team:
+     *   [coords_sh | src_sh | k_sh | r_sh | padding]
+     */
+    KOKKOS_INLINE_FUNCTION
+    size_t team_shmem_size( const int /*ts*/ ) const
+    {
+        const int nlev = r_tile_ + 1;
+        const int n    = lat_tile_ + 1;
+        const int nxy  = n * n;
+
+        const size_t nscalars =
+            size_t( nxy ) * 3 + size_t( nxy ) * 3 * nlev + size_t( nxy ) * nlev + size_t( nlev ) + 1;
+
+        return sizeof( ScalarType ) * nscalars;
+    }
+
+  private:
+    /**
+     * @brief Decode a team league rank / team rank into:
+     * - tile origin (x0,y0,r0)
+     * - intra-tile thread coordinates (tx,ty,tr)
+     * - target cell (x_cell,y_cell,r_cell)
+     */
+    KOKKOS_INLINE_FUNCTION
+    void decode_team_indices(
+        const Team& team,
+        int&        local_subdomain_id,
+        int&        x0,
+        int&        y0,
+        int&        r0,
+        int&        tx,
+        int&        ty,
+        int&        tr,
+        int&        x_cell,
+        int&        y_cell,
+        int&        r_cell ) const
+    {
+        int tmp = team.league_rank();
+
+        const int r_tile_id = tmp % r_tiles_;
+        tmp /= r_tiles_;
+
+        const int lat_y_id = tmp % lat_tiles_;
+        tmp /= lat_tiles_;
+
+        const int lat_x_id = tmp % lat_tiles_;
+        tmp /= lat_tiles_;
+
+        local_subdomain_id = tmp;
+
+        x0 = lat_x_id * lat_tile_;
+        y0 = lat_y_id * lat_tile_;
+        r0 = r_tile_id * r_tile_;
+
+        const int tid = team.team_rank();
+        tx            = tid % lat_tile_;
+        ty            = ( tid / lat_tile_ ) % lat_tile_;
+        tr            = tid / ( lat_tile_ * lat_tile_ );
+
+        x_cell = x0 + tx;
+        y_cell = y0 + ty;
+        r_cell = r0 + tr;
+    }
+
+    // -------------------------------------------------------------------------
+    // Path-specific team entry points (NO path branching)
+    // These are the functions called directly by host-dispatched kernel launches.
+    // -------------------------------------------------------------------------
+
+    /**
+     * @brief Team entry for slow (local-matrix) path.
+     *
+     * This wrapper performs only:
+     * - team index decoding
+     * - boundary flag queries
+     * - forwarding to operator_slow_path()
+     *
+     * No dispatch branching happens here.
+     */
+    KOKKOS_INLINE_FUNCTION
+    void run_team_slow( const Team& team ) const
+    {
+        int local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell;
+        decode_team_indices( team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell );
+
+        if ( tr >= r_tile_ )
+            return;
+
+        const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
+        const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
+
+        operator_slow_path(
+            team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
+    }
+
+    /**
+     * @brief Team entry for fast Dirichlet/Neumann matrix-free path.
+     */
+    KOKKOS_INLINE_FUNCTION
+    void run_team_fast_dirichlet_neumann( const Team& team ) const
+    {
+        int local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell;
+        decode_team_indices( team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell );
+
+        if ( tr >= r_tile_ )
+            return;
+
+        const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
+        const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
+
+        operator_fast_dirichlet_neumann_path(
+            team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
+    }
+
+    /**
+     * @brief Team entry for fast free-slip matrix-free path.
+     */
+    KOKKOS_INLINE_FUNCTION
+    void run_team_fast_freeslip( const Team& team ) const
+    {
+        int local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell;
+        decode_team_indices( team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell );
+
+        if ( tr >= r_tile_ )
+            return;
+
+        const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
+        const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
+
+        operator_fast_freeslip_path(
+            team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
+    }
+
+    // ===================== SLOW PATH =====================
+    KOKKOS_INLINE_FUNCTION
+    void operator_slow_path(
+        const Team& team,
+        const int   local_subdomain_id,
+        const int   x0,
+        const int   y0,
+        const int   r0,
+        const int   tx,
+        const int   ty,
+        const int   tr,
+        const int   x_cell,
+        const int   y_cell,
+        const int   r_cell,
+        const bool  at_cmb,
+        const bool  at_surface ) const
+    {
+        (void) team;
+        (void) x0;
+        (void) y0;
+        (void) r0;
+        (void) tx;
+        (void) ty;
+        (void) tr;
+
+        if ( x_cell >= hex_lat_ || y_cell >= hex_lat_ || r_cell >= hex_rad_ )
+            return;
+
+        dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > A[num_wedges_per_hex_cell] = { 0 };
+
+        if ( operator_stored_matrix_mode_ == linalg::OperatorStoredMatrixMode::Full )
+        {
+            A[0] = local_matrix_storage_.get_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 0 );
+            A[1] = local_matrix_storage_.get_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 1 );
+        }
+        else if ( operator_stored_matrix_mode_ == linalg::OperatorStoredMatrixMode::Selective )
+        {
+            if ( local_matrix_storage_.has_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 0 ) &&
+                 local_matrix_storage_.has_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 1 ) )
             {
-                // gca on all elements, load local matrices
                 A[0] = local_matrix_storage_.get_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 0 );
                 A[1] = local_matrix_storage_.get_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 1 );
             }
-            else if ( operator_stored_matrix_mode_ == linalg::OperatorStoredMatrixMode::Selective )
-            {
-                // adaptive gca: check if we have a matrix stored for this element
-                if ( local_matrix_storage_.has_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 0 ) &&
-                     local_matrix_storage_.has_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 1 ) )
-                {
-                    // large coefficient variation element: use stored gca matrix
-                    A[0] = local_matrix_storage_.get_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 0 );
-                    A[1] = local_matrix_storage_.get_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 1 );
-                }
-                else
-                {
-                    // low coefficient variation: assemble matrix on-the-fly using dca
-                    A[0] = assemble_local_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 0 );
-                    A[1] = assemble_local_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 1 );
-                }
-            }
             else
             {
-                // boundary element: assemble matrix on-the-fly using dca
                 A[0] = assemble_local_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 0 );
                 A[1] = assemble_local_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 1 );
-            }
-
-            // read source dofs
-            dense::Vec< ScalarT, 18 > src[num_wedges_per_hex_cell];
-            for ( int dimj = 0; dimj < 3; dimj++ )
-            {
-                dense::Vec< ScalarT, 6 > src_d[num_wedges_per_hex_cell];
-                extract_local_wedge_vector_coefficients(
-                    src_d, local_subdomain_id, x_cell, y_cell, r_cell, dimj, src_ );
-
-                for ( int wedge = 0; wedge < num_wedges_per_hex_cell; wedge++ )
-                {
-                    for ( int i = 0; i < num_nodes_per_wedge; i++ )
-                    {
-                        src[wedge]( dimj * num_nodes_per_wedge + i ) = src_d[wedge]( i );
-                    }
-                }
-            }
-
-            // Boundary treatment
-            dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > boundary_mask;
-            boundary_mask.fill( 1.0 );
-
-            // flag to later not go through the hustle of checking the bcs
-            bool                                                  freeslip_reorder = false;
-            dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > R[num_wedges_per_hex_cell];
-
-            if ( at_cmb || at_surface )
-            {
-                // Inner boundary (CMB).
-                ShellBoundaryFlag     sbf = at_cmb ? CMB : SURFACE;
-                BoundaryConditionFlag bcf = get_boundary_condition_flag( bcs_, sbf );
-
-                if ( bcf == DIRICHLET )
-                {
-                    for ( int dimi = 0; dimi < 3; ++dimi )
-                    {
-                        for ( int dimj = 0; dimj < 3; ++dimj )
-                        {
-                            for ( int i = 0; i < num_nodes_per_wedge; i++ )
-                            {
-                                for ( int j = 0; j < num_nodes_per_wedge; j++ )
-                                {
-                                    if ( ( at_cmb && ( ( dimi == dimj /* at diagonal eps component */ &&
-                                                         i != j /* dont kill the diag */ &&
-                                                         ( i < 3 || j < 3 /* CMB -> bc at bot layer dofs */ ) ) ||
-                                                       ( dimi != dimj /* off-diagonal eps component, kill diag too */ &&
-                                                         ( i < 3 || j < 3 ) ) ) ) ||
-                                         ( at_surface &&
-                                           ( ( dimi == dimj /* at diagonal eps component */ &&
-                                               i != j /* dont kill the diag */ &&
-                                               ( i >= 3 || j >= 3 /* SUFACE -> bc at top layer dofs */ ) ) ||
-                                             ( dimi != dimj /* off-diagonal eps component, kill diag too */ &&
-                                               ( i >= 3 || j >= 3 ) ) ) ) )
-                                    {
-                                        boundary_mask(
-                                            i + dimi * num_nodes_per_wedge, j + dimj * num_nodes_per_wedge ) = 0.0;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                else if ( bcf == FREESLIP )
-                {
-                    freeslip_reorder                                                                     = true;
-                    dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > A_tmp[num_wedges_per_hex_cell] = { 0 };
-
-                    // reorder source dofs for nodes instead of velocity dims in src vector and local matrix
-                    for ( int wedge = 0; wedge < 2; ++wedge )
-                    {
-                        for ( int dimi = 0; dimi < 3; ++dimi )
-                        {
-                            for ( int node_idxi = 0; node_idxi < num_nodes_per_wedge; node_idxi++ )
-                            {
-                                for ( int dimj = 0; dimj < 3; ++dimj )
-                                {
-                                    for ( int node_idxj = 0; node_idxj < num_nodes_per_wedge; node_idxj++ )
-                                    {
-                                        A_tmp[wedge]( node_idxi * 3 + dimi, node_idxj * 3 + dimj ) = A[wedge](
-                                            node_idxi + dimi * num_nodes_per_wedge,
-                                            node_idxj + dimj * num_nodes_per_wedge );
-                                    }
-                                }
-                            }
-                        }
-                        reorder_local_dofs( DoFOrdering::DIMENSIONWISE, DoFOrdering::NODEWISE, src[wedge] );
-                    }
-
-                    // assemble rotation matrices for boundary nodes
-                    // e.g. if we are at CMB, we need to rotate DoFs 0, 1, 2 of each wedge
-                    // at SURFACE, we need to rotate DoFs 3, 4, 5
-
-                    constexpr int layer_hex_offset_x[2][3] = { { 0, 1, 0 }, { 1, 0, 1 } };
-                    constexpr int layer_hex_offset_y[2][3] = { { 0, 0, 1 }, { 1, 1, 0 } };
-
-                    for ( int wedge = 0; wedge < 2; ++wedge )
-                    {
-                        // make rotation matrix unity
-                        for ( int i = 0; i < LocalMatrixDim; ++i )
-                        {
-                            R[wedge]( i, i ) = 1.0;
-                        }
-
-                        for ( int boundary_node_idx = 0; boundary_node_idx < 3; boundary_node_idx++ )
-                        {
-                            // compute normal
-                            dense::Vec< double, 3 > normal = grid::shell::coords(
-                                local_subdomain_id,
-                                x_cell + layer_hex_offset_x[wedge][boundary_node_idx],
-                                y_cell + layer_hex_offset_y[wedge][boundary_node_idx],
-                                r_cell + ( at_cmb ? 0 : 1 ),
-                                grid_,
-                                radii_ );
-                          
-
-                            // compute rotation matrix for DoFs on current node
-                            auto R_i = trafo_mat_cartesian_to_normal_tangential( normal );
-
-                            // insert into wedge-local rotation matrix
-                            int offset_in_R = at_cmb ? 0 : 9;
-                            for ( int dimi = 0; dimi < 3; ++dimi )
-                            {
-                                for ( int dimj = 0; dimj < 3; ++dimj )
-                                {
-                                    R[wedge](
-                                        offset_in_R + boundary_node_idx * 3 + dimi,
-                                        offset_in_R + boundary_node_idx * 3 + dimj ) = R_i( dimi, dimj );
-                                }
-                            }
-                        }
-
-                        // transform local matrix to rotated/ normal-tangential space: pre/post multiply with rotation matrices
-                        // TODO transpose this way?
-                        A[wedge] = R[wedge] * A_tmp[wedge] * R[wedge].transposed();
-                        // transform source dofs to nt-space
-                        auto src_tmp = R[wedge] * src[wedge];
-                        for ( int i = 0; i < 18; ++i )
-                        {
-                            src[wedge]( i ) = src_tmp( i );
-                        }
-
-                        // eliminate normal components: Dirichlet on the normal-tangential system
-                        int node_start = at_surface ? 3 : 0;
-                        int node_end   = at_surface ? 6 : 3;
-
-                        for ( int node_idx = node_start; node_idx < node_end; node_idx++ )
-                        {
-                            int idx = node_idx * 3;
-                            /* Eliminate rows and cols for dofs corresponding to the normal component of a velocity */
-                            for ( int k = 0; k < 18; ++k )
-                            {
-                                if ( k != idx )
-                                {
-                                    boundary_mask( idx, k ) = 0.0;
-                                    boundary_mask( k, idx ) = 0.0;
-                                }
-                            }
-                        }
-                    }
-                }
-                else if ( bcf == NEUMANN ) {}
-            }
-
-            // apply boundary mask
-            for ( int wedge = 0; wedge < num_wedges_per_hex_cell; wedge++ )
-            {
-                A[wedge].hadamard_product( boundary_mask );
-            }
-
-            if ( diagonal_ )
-            {
-                A[0] = A[0].diagonal();
-                A[1] = A[1].diagonal();
-            }
-
-            dense::Vec< ScalarT, LocalMatrixDim > dst[num_wedges_per_hex_cell];
-            dst[0] = A[0] * src[0];
-            dst[1] = A[1] * src[1];
-
-            if ( freeslip_reorder )
-            {
-                // transform dst back from nt space
-                dense::Vec< ScalarT, LocalMatrixDim > dst_tmp[num_wedges_per_hex_cell];
-                dst_tmp[0] = R[0].transposed() * dst[0];
-                dst_tmp[1] = R[1].transposed() * dst[1];
-                for ( int i = 0; i < 18; ++i )
-                {
-                    dst[0]( i ) = dst_tmp[0]( i );
-                    dst[1]( i ) = dst_tmp[1]( i );
-                }
-
-                // reorder to dimensionwise ordering
-                reorder_local_dofs( DoFOrdering::NODEWISE, DoFOrdering::DIMENSIONWISE, dst[0] );
-                reorder_local_dofs( DoFOrdering::NODEWISE, DoFOrdering::DIMENSIONWISE, dst[1] );
-            }
-
-            for ( int dimi = 0; dimi < 3; dimi++ )
-            {
-                dense::Vec< ScalarT, 6 > dst_d[num_wedges_per_hex_cell];
-                dst_d[0] = dst[0].template slice< 6 >( dimi * num_nodes_per_wedge );
-                dst_d[1] = dst[1].template slice< 6 >( dimi * num_nodes_per_wedge );
-
-                atomically_add_local_wedge_vector_coefficients(
-                    dst_, local_subdomain_id, x_cell, y_cell, r_cell, dimi, dst_d );
             }
         }
         else
         {
-            double wedge_surf_phy_coords[2][3][3];
+            A[0] = assemble_local_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 0 );
+            A[1] = assemble_local_matrix( local_subdomain_id, x_cell, y_cell, r_cell, 1 );
+        }
+
+        dense::Vec< ScalarT, 18 > src[num_wedges_per_hex_cell];
+        for ( int dimj = 0; dimj < 3; dimj++ )
+        {
+            dense::Vec< ScalarT, 6 > src_d[num_wedges_per_hex_cell];
+            extract_local_wedge_vector_coefficients( src_d, local_subdomain_id, x_cell, y_cell, r_cell, dimj, src_ );
+
+            for ( int wedge = 0; wedge < num_wedges_per_hex_cell; wedge++ )
             {
-                double quad_surface_coords[2][2][3];
-                ;
-                quad_surface_coords[0][0][0]   = grid_( local_subdomain_id, x_cell, y_cell, 0 );
-                quad_surface_coords[0][0][1]   = grid_( local_subdomain_id, x_cell, y_cell, 1 );
-                quad_surface_coords[0][0][2]   = grid_( local_subdomain_id, x_cell, y_cell, 2 );
-                quad_surface_coords[0][1][0]   = grid_( local_subdomain_id, x_cell, y_cell + 1, 0 );
-                quad_surface_coords[0][1][1]   = grid_( local_subdomain_id, x_cell, y_cell + 1, 1 );
-                quad_surface_coords[0][1][2]   = grid_( local_subdomain_id, x_cell, y_cell + 1, 2 );
-                quad_surface_coords[1][0][0]   = grid_( local_subdomain_id, x_cell + 1, y_cell, 0 );
-                quad_surface_coords[1][0][1]   = grid_( local_subdomain_id, x_cell + 1, y_cell, 1 );
-                quad_surface_coords[1][0][2]   = grid_( local_subdomain_id, x_cell + 1, y_cell, 2 );
-                quad_surface_coords[1][1][0]   = grid_( local_subdomain_id, x_cell + 1, y_cell + 1, 0 );
-                quad_surface_coords[1][1][1]   = grid_( local_subdomain_id, x_cell + 1, y_cell + 1, 1 );
-                quad_surface_coords[1][1][2]   = grid_( local_subdomain_id, x_cell + 1, y_cell + 1, 2 );
-                wedge_surf_phy_coords[0][0][0] = quad_surface_coords[0][0][0];
-                wedge_surf_phy_coords[0][0][1] = quad_surface_coords[0][0][1];
-                wedge_surf_phy_coords[0][0][2] = quad_surface_coords[0][0][2];
-                wedge_surf_phy_coords[0][1][0] = quad_surface_coords[1][0][0];
-                wedge_surf_phy_coords[0][1][1] = quad_surface_coords[1][0][1];
-                wedge_surf_phy_coords[0][1][2] = quad_surface_coords[1][0][2];
-                wedge_surf_phy_coords[0][2][0] = quad_surface_coords[0][1][0];
-                wedge_surf_phy_coords[0][2][1] = quad_surface_coords[0][1][1];
-                wedge_surf_phy_coords[0][2][2] = quad_surface_coords[0][1][2];
-                wedge_surf_phy_coords[1][0][0] = quad_surface_coords[1][1][0];
-                wedge_surf_phy_coords[1][0][1] = quad_surface_coords[1][1][1];
-                wedge_surf_phy_coords[1][0][2] = quad_surface_coords[1][1][2];
-                wedge_surf_phy_coords[1][1][0] = quad_surface_coords[0][1][0];
-                wedge_surf_phy_coords[1][1][1] = quad_surface_coords[0][1][1];
-                wedge_surf_phy_coords[1][1][2] = quad_surface_coords[0][1][2];
-                wedge_surf_phy_coords[1][2][0] = quad_surface_coords[1][0][0];
-                wedge_surf_phy_coords[1][2][1] = quad_surface_coords[1][0][1];
-                wedge_surf_phy_coords[1][2][2] = quad_surface_coords[1][0][2];
-            }
-            double r_0 = radii_( local_subdomain_id, r_cell );
-            double r_1 = radii_( local_subdomain_id, r_cell + 1 );
-            double src_local_hex[3][2][6];
-            int    dim;
-            for ( dim = 0; dim < 3; dim += 1 )
-            {
-                src_local_hex[dim][0][0] = src_( local_subdomain_id, x_cell, y_cell, r_cell, dim );
-                src_local_hex[dim][0][1] = src_( local_subdomain_id, x_cell + 1, y_cell, r_cell, dim );
-                src_local_hex[dim][0][2] = src_( local_subdomain_id, x_cell, y_cell + 1, r_cell, dim );
-                src_local_hex[dim][0][3] = src_( local_subdomain_id, x_cell, y_cell, r_cell + 1, dim );
-                src_local_hex[dim][0][4] = src_( local_subdomain_id, x_cell + 1, y_cell, r_cell + 1, dim );
-                src_local_hex[dim][0][5] = src_( local_subdomain_id, x_cell, y_cell + 1, r_cell + 1, dim );
-                src_local_hex[dim][1][0] = src_( local_subdomain_id, x_cell + 1, y_cell + 1, r_cell, dim );
-                src_local_hex[dim][1][1] = src_( local_subdomain_id, x_cell, y_cell + 1, r_cell, dim );
-                src_local_hex[dim][1][2] = src_( local_subdomain_id, x_cell + 1, y_cell, r_cell, dim );
-                src_local_hex[dim][1][3] = src_( local_subdomain_id, x_cell + 1, y_cell + 1, r_cell + 1, dim );
-                src_local_hex[dim][1][4] = src_( local_subdomain_id, x_cell, y_cell + 1, r_cell + 1, dim );
-                src_local_hex[dim][1][5] = src_( local_subdomain_id, x_cell + 1, y_cell, r_cell + 1, dim );
-            };
-            double k_local_hex[2][6];
-            k_local_hex[0][0] = k_( local_subdomain_id, x_cell, y_cell, r_cell );
-            k_local_hex[0][1] = k_( local_subdomain_id, x_cell + 1, y_cell, r_cell );
-            k_local_hex[0][2] = k_( local_subdomain_id, x_cell, y_cell + 1, r_cell );
-            k_local_hex[0][3] = k_( local_subdomain_id, x_cell, y_cell, r_cell + 1 );
-            k_local_hex[0][4] = k_( local_subdomain_id, x_cell + 1, y_cell, r_cell + 1 );
-            k_local_hex[0][5] = k_( local_subdomain_id, x_cell, y_cell + 1, r_cell + 1 );
-            k_local_hex[1][0] = k_( local_subdomain_id, x_cell + 1, y_cell + 1, r_cell );
-            k_local_hex[1][1] = k_( local_subdomain_id, x_cell, y_cell + 1, r_cell );
-            k_local_hex[1][2] = k_( local_subdomain_id, x_cell + 1, y_cell, r_cell );
-            k_local_hex[1][3] = k_( local_subdomain_id, x_cell + 1, y_cell + 1, r_cell + 1 );
-            k_local_hex[1][4] = k_( local_subdomain_id, x_cell, y_cell + 1, r_cell + 1 );
-            k_local_hex[1][5] = k_( local_subdomain_id, x_cell + 1, y_cell, r_cell + 1 );
-            double qp_array[1][3];
-            double qw_array[1];
-            qp_array[0][0]          = 0.33333333333333331;
-            qp_array[0][1]          = 0.33333333333333331;
-            qp_array[0][2]          = 0.0;
-            qw_array[0]             = 1.0;
-            int at_cmb_boundary     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
-            int at_surface_boundary = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
-            int cmb_shift = ( ( false && diagonal_ == false && at_cmb_boundary != 0 ) ? ( 3 ) : ( 0 ) );
-            int max_rad   = radii_.extent( 1 ) - 1;
-            int surface_shift =
-                ( ( false && diagonal_ == false && at_surface_boundary != 0 ) ? ( 3 ) : ( 0 ) );
-            double dst_array[3][2][6] = { 0 };
-            int    w                  = 0;
-            /* Apply local matrix for both wedges and accumulated for all quadrature points. */;
-            for ( w = 0; w < 2; w += 1 )
-            {
-                int q = 0;
-                for ( q = 0; q < 1; q += 1 )
+                for ( int i = 0; i < num_nodes_per_wedge; i++ )
                 {
-                    /* Coefficient evaluation on current wedge w */;
-                    double tmpcse_k_eval_0 = ( 1.0 / 2.0 ) * qp_array[q][2];
-                    double tmpcse_k_eval_1 = 1.0 / 2.0 - tmpcse_k_eval_0;
-                    double tmpcse_k_eval_2 = tmpcse_k_eval_0 + 1.0 / 2.0;
-                    double tmpcse_k_eval_3 = -qp_array[q][0] - qp_array[q][1] + 1;
-                    double k_eval          = tmpcse_k_eval_1 * tmpcse_k_eval_3 * k_local_hex[w][0] +
-                                    tmpcse_k_eval_1 * k_local_hex[w][1] * qp_array[q][0] +
-                                    tmpcse_k_eval_1 * k_local_hex[w][2] * qp_array[q][1] +
-                                    tmpcse_k_eval_2 * tmpcse_k_eval_3 * k_local_hex[w][3] +
-                                    tmpcse_k_eval_2 * k_local_hex[w][4] * qp_array[q][0] +
-                                    tmpcse_k_eval_2 * k_local_hex[w][5] * qp_array[q][1];
+                    src[wedge]( dimj * num_nodes_per_wedge + i ) = src_d[wedge]( i );
+                }
+            }
+        }
 
-                    double scalar_grad[6][3] = { 0 };
-                    /* Computation + Inversion of the Jacobian */;
-                    double tmpcse_J_0 = -1.0 / 2.0 * r_0 + ( 1.0 / 2.0 ) * r_1;
-                    double tmpcse_J_1 = r_0 + tmpcse_J_0 * ( qp_array[q][2] + 1 );
-                    double tmpcse_J_2 = -qp_array[q][0] - qp_array[q][1] + 1;
-                    double J_0_0 = tmpcse_J_1 * ( -wedge_surf_phy_coords[w][0][0] + wedge_surf_phy_coords[w][1][0] );
-                    double J_0_1 = tmpcse_J_1 * ( -wedge_surf_phy_coords[w][0][0] + wedge_surf_phy_coords[w][2][0] );
-                    double J_0_2 = tmpcse_J_0 * ( tmpcse_J_2 * wedge_surf_phy_coords[w][0][0] +
-                                                  qp_array[q][0] * wedge_surf_phy_coords[w][1][0] +
-                                                  qp_array[q][1] * wedge_surf_phy_coords[w][2][0] );
-                    double J_1_0 = tmpcse_J_1 * ( -wedge_surf_phy_coords[w][0][1] + wedge_surf_phy_coords[w][1][1] );
-                    double J_1_1 = tmpcse_J_1 * ( -wedge_surf_phy_coords[w][0][1] + wedge_surf_phy_coords[w][2][1] );
-                    double J_1_2 = tmpcse_J_0 * ( tmpcse_J_2 * wedge_surf_phy_coords[w][0][1] +
-                                                  qp_array[q][0] * wedge_surf_phy_coords[w][1][1] +
-                                                  qp_array[q][1] * wedge_surf_phy_coords[w][2][1] );
-                    double J_2_0 = tmpcse_J_1 * ( -wedge_surf_phy_coords[w][0][2] + wedge_surf_phy_coords[w][1][2] );
-                    double J_2_1 = tmpcse_J_1 * ( -wedge_surf_phy_coords[w][0][2] + wedge_surf_phy_coords[w][2][2] );
-                    double J_2_2 = tmpcse_J_0 * ( tmpcse_J_2 * wedge_surf_phy_coords[w][0][2] +
-                                                  qp_array[q][0] * wedge_surf_phy_coords[w][1][2] +
-                                                  qp_array[q][1] * wedge_surf_phy_coords[w][2][2] );
-                    double J_det = J_0_0 * J_1_1 * J_2_2 - J_0_0 * J_1_2 * J_2_1 - J_0_1 * J_1_0 * J_2_2 +
-                                   J_0_1 * J_1_2 * J_2_0 + J_0_2 * J_1_0 * J_2_1 - J_0_2 * J_1_1 * J_2_0;
-                    double tmpcse_J_invT_0 = 1.0 / J_det;
-                    double J_invT_cse_0_0  = tmpcse_J_invT_0 * ( J_1_1 * J_2_2 - J_1_2 * J_2_1 );
-                    double J_invT_cse_0_1  = tmpcse_J_invT_0 * ( -J_1_0 * J_2_2 + J_1_2 * J_2_0 );
-                    double J_invT_cse_0_2  = tmpcse_J_invT_0 * ( J_1_0 * J_2_1 - J_1_1 * J_2_0 );
-                    double J_invT_cse_1_0  = tmpcse_J_invT_0 * ( -J_0_1 * J_2_2 + J_0_2 * J_2_1 );
-                    double J_invT_cse_1_1  = tmpcse_J_invT_0 * ( J_0_0 * J_2_2 - J_0_2 * J_2_0 );
-                    double J_invT_cse_1_2  = tmpcse_J_invT_0 * ( -J_0_0 * J_2_1 + J_0_1 * J_2_0 );
-                    double J_invT_cse_2_0  = tmpcse_J_invT_0 * ( J_0_1 * J_1_2 - J_0_2 * J_1_1 );
-                    double J_invT_cse_2_1  = tmpcse_J_invT_0 * ( -J_0_0 * J_1_2 + J_0_2 * J_1_0 );
-                    double J_invT_cse_2_2  = tmpcse_J_invT_0 * ( J_0_0 * J_1_1 - J_0_1 * J_1_0 );
-                    /* Computation of the gradient of the scalar shape functions belonging to each DoF.
-      In the Eps-component-loops, we insert the gradient at the entry of the
-      vectorial gradient matrix corresponding to the Eps-component. */
-                    ;
-                    double tmpcse_grad_i_0  = ( 1.0 / 2.0 ) * qp_array[q][2];
-                    double tmpcse_grad_i_1  = tmpcse_grad_i_0 - 1.0 / 2.0;
-                    double tmpcse_grad_i_2  = ( 1.0 / 2.0 ) * qp_array[q][0];
-                    double tmpcse_grad_i_3  = ( 1.0 / 2.0 ) * qp_array[q][1];
-                    double tmpcse_grad_i_4  = tmpcse_grad_i_2 + tmpcse_grad_i_3 - 1.0 / 2.0;
-                    double tmpcse_grad_i_5  = J_invT_cse_0_2 * tmpcse_grad_i_2;
-                    double tmpcse_grad_i_6  = -tmpcse_grad_i_1;
-                    double tmpcse_grad_i_7  = J_invT_cse_1_2 * tmpcse_grad_i_2;
-                    double tmpcse_grad_i_8  = J_invT_cse_2_2 * tmpcse_grad_i_2;
-                    double tmpcse_grad_i_9  = J_invT_cse_0_2 * tmpcse_grad_i_3;
-                    double tmpcse_grad_i_10 = J_invT_cse_1_2 * tmpcse_grad_i_3;
-                    double tmpcse_grad_i_11 = J_invT_cse_2_2 * tmpcse_grad_i_3;
-                    double tmpcse_grad_i_12 = tmpcse_grad_i_0 + 1.0 / 2.0;
-                    double tmpcse_grad_i_13 = -tmpcse_grad_i_12;
-                    double tmpcse_grad_i_14 = -tmpcse_grad_i_4;
-                    scalar_grad[0][0]       = J_invT_cse_0_0 * tmpcse_grad_i_1 + J_invT_cse_0_1 * tmpcse_grad_i_1 +
-                                        J_invT_cse_0_2 * tmpcse_grad_i_4;
-                    scalar_grad[0][1] = J_invT_cse_1_0 * tmpcse_grad_i_1 + J_invT_cse_1_1 * tmpcse_grad_i_1 +
-                                        J_invT_cse_1_2 * tmpcse_grad_i_4;
-                    scalar_grad[0][2] = J_invT_cse_2_0 * tmpcse_grad_i_1 + J_invT_cse_2_1 * tmpcse_grad_i_1 +
-                                        J_invT_cse_2_2 * tmpcse_grad_i_4;
-                    scalar_grad[1][0] = J_invT_cse_0_0 * tmpcse_grad_i_6 - tmpcse_grad_i_5;
-                    scalar_grad[1][1] = J_invT_cse_1_0 * tmpcse_grad_i_6 - tmpcse_grad_i_7;
-                    scalar_grad[1][2] = J_invT_cse_2_0 * tmpcse_grad_i_6 - tmpcse_grad_i_8;
-                    scalar_grad[2][0] = J_invT_cse_0_1 * tmpcse_grad_i_6 - tmpcse_grad_i_9;
-                    scalar_grad[2][1] = J_invT_cse_1_1 * tmpcse_grad_i_6 - tmpcse_grad_i_10;
-                    scalar_grad[2][2] = J_invT_cse_2_1 * tmpcse_grad_i_6 - tmpcse_grad_i_11;
-                    scalar_grad[3][0] = J_invT_cse_0_0 * tmpcse_grad_i_13 + J_invT_cse_0_1 * tmpcse_grad_i_13 +
-                                        J_invT_cse_0_2 * tmpcse_grad_i_14;
-                    scalar_grad[3][1] = J_invT_cse_1_0 * tmpcse_grad_i_13 + J_invT_cse_1_1 * tmpcse_grad_i_13 +
-                                        J_invT_cse_1_2 * tmpcse_grad_i_14;
-                    scalar_grad[3][2] = J_invT_cse_2_0 * tmpcse_grad_i_13 + J_invT_cse_2_1 * tmpcse_grad_i_13 +
-                                        J_invT_cse_2_2 * tmpcse_grad_i_14;
-                    scalar_grad[4][0] = J_invT_cse_0_0 * tmpcse_grad_i_12 + tmpcse_grad_i_5;
-                    scalar_grad[4][1] = J_invT_cse_1_0 * tmpcse_grad_i_12 + tmpcse_grad_i_7;
-                    scalar_grad[4][2] = J_invT_cse_2_0 * tmpcse_grad_i_12 + tmpcse_grad_i_8;
-                    scalar_grad[5][0] = J_invT_cse_0_1 * tmpcse_grad_i_12 + tmpcse_grad_i_9;
-                    scalar_grad[5][1] = J_invT_cse_1_1 * tmpcse_grad_i_12 + tmpcse_grad_i_10;
-                    scalar_grad[5][2] = J_invT_cse_2_1 * tmpcse_grad_i_12 + tmpcse_grad_i_11;
-                    int dimj;
+        dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > boundary_mask;
+        boundary_mask.fill( 1.0 );
 
-                    double grad_u[3][3] = { 0 };
-                    double div_u        = 0.0;
-                    /* In the following, we exploit the outer-product-structure of the local MV both in 
-      the components of the Epsilon operators and in the local DoFs. */
-                    ;
-                    /* Loop to assemble the trial gradient. */;
-                    for ( dimj = 0; dimj < 3; dimj += 1 )
-                    {
-                        if ( diagonal_ == false )
-                        {
-                            int node_idx;
-                            for ( node_idx = cmb_shift; node_idx < 6 - surface_shift; node_idx += 1 )
-                            {
-                                double E_grad_trial[3][3]     = { 0 };
-                                E_grad_trial[0][dimj]         = scalar_grad[node_idx][0];
-                                E_grad_trial[1][dimj]         = scalar_grad[node_idx][1];
-                                E_grad_trial[2][dimj]         = scalar_grad[node_idx][2];
-                                double tmpcse_symgrad_trial_0 = 0.5 * E_grad_trial[0][1] + 0.5 * E_grad_trial[1][0];
-                                double tmpcse_symgrad_trial_1 = 0.5 * E_grad_trial[0][2] + 0.5 * E_grad_trial[2][0];
-                                double tmpcse_symgrad_trial_2 = 0.5 * E_grad_trial[1][2] + 0.5 * E_grad_trial[2][1];
-                                grad_u[0][0] =
-                                    1.0 * E_grad_trial[0][0] * src_local_hex[dimj][w][node_idx] + grad_u[0][0];
-                                grad_u[0][1] = tmpcse_symgrad_trial_0 * src_local_hex[dimj][w][node_idx] + grad_u[0][1];
-                                grad_u[0][2] = tmpcse_symgrad_trial_1 * src_local_hex[dimj][w][node_idx] + grad_u[0][2];
-                                grad_u[1][0] = tmpcse_symgrad_trial_0 * src_local_hex[dimj][w][node_idx] + grad_u[1][0];
-                                grad_u[1][1] =
-                                    1.0 * E_grad_trial[1][1] * src_local_hex[dimj][w][node_idx] + grad_u[1][1];
-                                grad_u[1][2] = tmpcse_symgrad_trial_2 * src_local_hex[dimj][w][node_idx] + grad_u[1][2];
-                                grad_u[2][0] = tmpcse_symgrad_trial_1 * src_local_hex[dimj][w][node_idx] + grad_u[2][0];
-                                grad_u[2][1] = tmpcse_symgrad_trial_2 * src_local_hex[dimj][w][node_idx] + grad_u[2][1];
-                                grad_u[2][2] =
-                                    1.0 * E_grad_trial[2][2] * src_local_hex[dimj][w][node_idx] + grad_u[2][2];
-                                div_u = div_u + E_grad_trial[dimj][dimj] * src_local_hex[dimj][w][node_idx];
-                            };
-                        };
-                    };
-                    int dimi;
-                    /* Loop to pair the assembled trial gradient with the test gradients. */;
-                    for ( dimi = 0; dimi < 3; dimi += 1 )
-                    {
-                        if ( diagonal_ == false )
-                        {
-                            int node_idx;
-                            for ( node_idx = cmb_shift; node_idx < 6 - surface_shift; node_idx += 1 )
-                            {
-                                double E_grad_test[3][3]     = { 0 };
-                                E_grad_test[0][dimi]         = scalar_grad[node_idx][0];
-                                E_grad_test[1][dimi]         = scalar_grad[node_idx][1];
-                                E_grad_test[2][dimi]         = scalar_grad[node_idx][2];
-                                double tmpcse_symgrad_test_0 = 0.5 * E_grad_test[0][1] + 0.5 * E_grad_test[1][0];
-                                double tmpcse_symgrad_test_1 = 0.5 * E_grad_test[0][2] + 0.5 * E_grad_test[2][0];
-                                double tmpcse_symgrad_test_2 = 0.5 * E_grad_test[1][2] + 0.5 * E_grad_test[2][1];
-                                double tmpcse_pairing_0      = 2 * tmpcse_symgrad_test_0;
-                                double tmpcse_pairing_1      = 2 * tmpcse_symgrad_test_1;
-                                double tmpcse_pairing_2      = 2 * tmpcse_symgrad_test_2;
-                                dst_array[dimi][w][node_idx] =
-                                    k_eval *
-                                        ( -0.66666666666666663 * div_u * E_grad_test[dimi][dimi] +
-                                          tmpcse_pairing_0 * grad_u[0][1] + tmpcse_pairing_0 * grad_u[1][0] +
-                                          tmpcse_pairing_1 * grad_u[0][2] + tmpcse_pairing_1 * grad_u[2][0] +
-                                          tmpcse_pairing_2 * grad_u[1][2] + tmpcse_pairing_2 * grad_u[2][1] +
-                                          2.0 * E_grad_test[0][0] * grad_u[0][0] +
-                                          2.0 * E_grad_test[1][1] * grad_u[1][1] +
-                                          2.0 * E_grad_test[2][2] * grad_u[2][2] ) *
-                                        fabs( J_det ) * qw_array[q] +
-                                    dst_array[dimi][w][node_idx];
-                            };
-                        };
-                    };
-                    int dim_diagBC;
-                    /* Loop to apply BCs or only the diagonal of the operator. */;
-                    for ( dim_diagBC = 0; dim_diagBC < 3; dim_diagBC += 1 )
-                    {
-                        if ( diagonal_ || false && ( at_cmb_boundary != 0 || at_surface_boundary != 0 ) )
-                        {
-                            int node_idx;
-                            for ( node_idx = surface_shift; node_idx < 6 - cmb_shift; node_idx += 1 )
-                            {
-                                double E_grad_test[3][3]   = { 0 };
-                                E_grad_test[0][dim_diagBC] = scalar_grad[node_idx][0];
-                                E_grad_test[1][dim_diagBC] = scalar_grad[node_idx][1];
-                                E_grad_test[2][dim_diagBC] = scalar_grad[node_idx][2];
+        bool                                                  freeslip_reorder = false;
+        dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > R[num_wedges_per_hex_cell];
 
-                                double grad_u_diag[3][3]     = { 0 };
-                                double tmpcse_symgrad_test_0 = 0.5 * E_grad_test[0][1] + 0.5 * E_grad_test[1][0];
-                                double tmpcse_symgrad_test_1 = 0.5 * E_grad_test[0][2] + 0.5 * E_grad_test[2][0];
-                                double tmpcse_symgrad_test_2 = 0.5 * E_grad_test[1][2] + 0.5 * E_grad_test[2][1];
-                                grad_u_diag[0][0] = 1.0 * E_grad_test[0][0] * src_local_hex[dim_diagBC][w][node_idx];
-                                grad_u_diag[0][1] = tmpcse_symgrad_test_0 * src_local_hex[dim_diagBC][w][node_idx];
-                                grad_u_diag[0][2] = tmpcse_symgrad_test_1 * src_local_hex[dim_diagBC][w][node_idx];
-                                grad_u_diag[1][0] = tmpcse_symgrad_test_0 * src_local_hex[dim_diagBC][w][node_idx];
-                                grad_u_diag[1][1] = 1.0 * E_grad_test[1][1] * src_local_hex[dim_diagBC][w][node_idx];
-                                grad_u_diag[1][2] = tmpcse_symgrad_test_2 * src_local_hex[dim_diagBC][w][node_idx];
-                                grad_u_diag[2][0] = tmpcse_symgrad_test_1 * src_local_hex[dim_diagBC][w][node_idx];
-                                grad_u_diag[2][1] = tmpcse_symgrad_test_2 * src_local_hex[dim_diagBC][w][node_idx];
-                                grad_u_diag[2][2] = 1.0 * E_grad_test[2][2] * src_local_hex[dim_diagBC][w][node_idx];
-                                double tmpcse_pairing_0 = 4 * src_local_hex[dim_diagBC][w][node_idx];
-                                double tmpcse_pairing_1 = 2.0 * src_local_hex[dim_diagBC][w][node_idx];
-                                dst_array[dim_diagBC][w][node_idx] =
-                                    k_eval *
-                                        ( tmpcse_pairing_0 * pow( tmpcse_symgrad_test_0, 2 ) +
-                                          tmpcse_pairing_0 * pow( tmpcse_symgrad_test_1, 2 ) +
-                                          tmpcse_pairing_0 * pow( tmpcse_symgrad_test_2, 2 ) +
-                                          tmpcse_pairing_1 * pow( E_grad_test[0][0], 2 ) +
-                                          tmpcse_pairing_1 * pow( E_grad_test[1][1], 2 ) +
-                                          tmpcse_pairing_1 * pow( E_grad_test[2][2], 2 ) -
-                                          0.66666666666666663 * pow( E_grad_test[dim_diagBC][dim_diagBC], 2 ) *
-                                              src_local_hex[dim_diagBC][w][node_idx] ) *
-                                        fabs( J_det ) * qw_array[q] +
-                                    dst_array[dim_diagBC][w][node_idx];
-                            };
-                        };
-                    };
-                };
-            };
-            int dim_add;
-            for ( dim_add = 0; dim_add < 3; dim_add += 1 )
+        if ( at_cmb || at_surface )
+        {
+            ShellBoundaryFlag     sbf = at_cmb ? CMB : SURFACE;
+            BoundaryConditionFlag bcf = get_boundary_condition_flag( bcs_, sbf );
+
+            if ( bcf == DIRICHLET )
             {
-                Kokkos::atomic_add(
-                    &dst_( local_subdomain_id, x_cell, y_cell, r_cell, dim_add ), dst_array[dim_add][0][0] );
-                Kokkos::atomic_add(
-                    &dst_( local_subdomain_id, x_cell + 1, y_cell, r_cell, dim_add ),
-                    dst_array[dim_add][0][1] + dst_array[dim_add][1][2] );
-                Kokkos::atomic_add(
-                    &dst_( local_subdomain_id, x_cell, y_cell + 1, r_cell, dim_add ),
-                    dst_array[dim_add][0][2] + dst_array[dim_add][1][1] );
-                Kokkos::atomic_add(
-                    &dst_( local_subdomain_id, x_cell, y_cell, r_cell + 1, dim_add ), dst_array[dim_add][0][3] );
-                Kokkos::atomic_add(
-                    &dst_( local_subdomain_id, x_cell + 1, y_cell, r_cell + 1, dim_add ),
-                    dst_array[dim_add][0][4] + dst_array[dim_add][1][5] );
-                Kokkos::atomic_add(
-                    &dst_( local_subdomain_id, x_cell, y_cell + 1, r_cell + 1, dim_add ),
-                    dst_array[dim_add][0][5] + dst_array[dim_add][1][4] );
-                Kokkos::atomic_add(
-                    &dst_( local_subdomain_id, x_cell + 1, y_cell + 1, r_cell, dim_add ), dst_array[dim_add][1][0] );
-                Kokkos::atomic_add(
-                    &dst_( local_subdomain_id, x_cell + 1, y_cell + 1, r_cell + 1, dim_add ),
-                    dst_array[dim_add][1][3] );
-            };
+                for ( int dimi = 0; dimi < 3; ++dimi )
+                {
+                    for ( int dimj = 0; dimj < 3; ++dimj )
+                    {
+                        for ( int i = 0; i < num_nodes_per_wedge; i++ )
+                        {
+                            for ( int j = 0; j < num_nodes_per_wedge; j++ )
+                            {
+                                if ( ( at_cmb && ( ( dimi == dimj && i != j && ( i < 3 || j < 3 ) ) ||
+                                                   ( dimi != dimj && ( i < 3 || j < 3 ) ) ) ) ||
+                                     ( at_surface && ( ( dimi == dimj && i != j && ( i >= 3 || j >= 3 ) ) ||
+                                                       ( dimi != dimj && ( i >= 3 || j >= 3 ) ) ) ) )
+                                {
+                                    boundary_mask( i + dimi * num_nodes_per_wedge, j + dimj * num_nodes_per_wedge ) =
+                                        0.0;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else if ( bcf == FREESLIP )
+            {
+                freeslip_reorder                                                                     = true;
+                dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > A_tmp[num_wedges_per_hex_cell] = { 0 };
+
+                for ( int wedge = 0; wedge < 2; ++wedge )
+                {
+                    for ( int dimi = 0; dimi < 3; ++dimi )
+                    {
+                        for ( int node_idxi = 0; node_idxi < num_nodes_per_wedge; node_idxi++ )
+                        {
+                            for ( int dimj = 0; dimj < 3; ++dimj )
+                            {
+                                for ( int node_idxj = 0; node_idxj < num_nodes_per_wedge; node_idxj++ )
+                                {
+                                    A_tmp[wedge]( node_idxi * 3 + dimi, node_idxj * 3 + dimj ) = A[wedge](
+                                        node_idxi + dimi * num_nodes_per_wedge,
+                                        node_idxj + dimj * num_nodes_per_wedge );
+                                }
+                            }
+                        }
+                    }
+                    reorder_local_dofs( DoFOrdering::DIMENSIONWISE, DoFOrdering::NODEWISE, src[wedge] );
+                }
+
+                constexpr int layer_hex_offset_x[2][3] = { { 0, 1, 0 }, { 1, 0, 1 } };
+                constexpr int layer_hex_offset_y[2][3] = { { 0, 0, 1 }, { 1, 1, 0 } };
+
+                for ( int wedge = 0; wedge < 2; ++wedge )
+                {
+                    for ( int i = 0; i < LocalMatrixDim; ++i )
+                    {
+                        R[wedge]( i, i ) = 1.0;
+                    }
+
+                    for ( int boundary_node_idx = 0; boundary_node_idx < 3; boundary_node_idx++ )
+                    {
+                        dense::Vec< double, 3 > normal = grid::shell::coords(
+                            local_subdomain_id,
+                            x_cell + layer_hex_offset_x[wedge][boundary_node_idx],
+                            y_cell + layer_hex_offset_y[wedge][boundary_node_idx],
+                            r_cell + ( at_cmb ? 0 : 1 ),
+                            grid_,
+                            radii_ );
+
+                        auto R_i = trafo_mat_cartesian_to_normal_tangential( normal );
+
+                        const int offset_in_R = at_cmb ? 0 : 9;
+                        for ( int dimi = 0; dimi < 3; ++dimi )
+                        {
+                            for ( int dimj = 0; dimj < 3; ++dimj )
+                            {
+                                R[wedge](
+                                    offset_in_R + boundary_node_idx * 3 + dimi,
+                                    offset_in_R + boundary_node_idx * 3 + dimj ) = R_i( dimi, dimj );
+                            }
+                        }
+                    }
+
+                    A[wedge] = R[wedge] * A_tmp[wedge] * R[wedge].transposed();
+
+                    auto src_tmp = R[wedge] * src[wedge];
+                    for ( int i = 0; i < 18; ++i )
+                    {
+                        src[wedge]( i ) = src_tmp( i );
+                    }
+
+                    const int node_start = at_surface ? 3 : 0;
+                    const int node_end   = at_surface ? 6 : 3;
+
+                    for ( int node_idx = node_start; node_idx < node_end; node_idx++ )
+                    {
+                        const int idx = node_idx * 3;
+                        for ( int k = 0; k < 18; ++k )
+                        {
+                            if ( k != idx )
+                            {
+                                boundary_mask( idx, k ) = 0.0;
+                                boundary_mask( k, idx ) = 0.0;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for ( int wedge = 0; wedge < num_wedges_per_hex_cell; wedge++ )
+        {
+            A[wedge].hadamard_product( boundary_mask );
+        }
+
+        if ( diagonal_ )
+        {
+            A[0] = A[0].diagonal();
+            A[1] = A[1].diagonal();
+        }
+
+        dense::Vec< ScalarT, LocalMatrixDim > dst[num_wedges_per_hex_cell];
+        dst[0] = A[0] * src[0];
+        dst[1] = A[1] * src[1];
+
+        if ( freeslip_reorder )
+        {
+            dense::Vec< ScalarT, LocalMatrixDim > dst_tmp[num_wedges_per_hex_cell];
+            dst_tmp[0] = R[0].transposed() * dst[0];
+            dst_tmp[1] = R[1].transposed() * dst[1];
+
+            for ( int i = 0; i < 18; ++i )
+            {
+                dst[0]( i ) = dst_tmp[0]( i );
+                dst[1]( i ) = dst_tmp[1]( i );
+            }
+
+            reorder_local_dofs( DoFOrdering::NODEWISE, DoFOrdering::DIMENSIONWISE, dst[0] );
+            reorder_local_dofs( DoFOrdering::NODEWISE, DoFOrdering::DIMENSIONWISE, dst[1] );
+        }
+
+        for ( int dimi = 0; dimi < 3; dimi++ )
+        {
+            dense::Vec< ScalarT, 6 > dst_d[num_wedges_per_hex_cell];
+            dst_d[0] = dst[0].template slice< 6 >( dimi * num_nodes_per_wedge );
+            dst_d[1] = dst[1].template slice< 6 >( dimi * num_nodes_per_wedge );
+
+            atomically_add_local_wedge_vector_coefficients(
+                dst_, local_subdomain_id, x_cell, y_cell, r_cell, dimi, dst_d );
         }
     }
 
-    /// @brief: For both trial and test space this function sets up a vector:
-    /// each vector element holds the symmetric gradient (a 3x3 matrix) of the shape function of the corresponding dof
-    /// (if dimi == dimj, these are the same and we are on the diagonal of the vectorial diffusion operator)
-    /// Additionally, we compute the scalar factor for the numerical integral comp: determinant of the jacobian,
-    /// evaluation of the coefficient k on the element and the quadrature weight of the current quad-point.
+    // ===================== FAST DIRICHLET/NEUMANN PATH =====================
+    KOKKOS_INLINE_FUNCTION
+    void operator_fast_dirichlet_neumann_path(
+        const Team& team,
+        const int   local_subdomain_id,
+        const int   x0,
+        const int   y0,
+        const int   r0,
+        const int   tx,
+        const int   ty,
+        const int   tr,
+        const int   x_cell,
+        const int   y_cell,
+        const int   r_cell,
+        const bool  at_cmb,
+        const bool  at_surface ) const
+    {
+        const int nlev = r_tile_ + 1;
+        const int nxy  = ( lat_tile_ + 1 ) * ( lat_tile_ + 1 );
 
-    /// The idea of this function is that the two vectors can be:
-    /// - accumulated to the result of the local matvec with 2 * num_nodes_per_wedge complexity
-    ///   by scaling the dot product of the trial vec and local src dofs with each element of the test vec
-    ///   (and adding to the dst dofs, this is the fused local matvec).
-    /// - propagated to the local matrix by an outer product of the two vectors
-    ///   (without applying it to dofs). This is e.g. required to assemble the finest grid local
-    ///   matrix on-the-fly during GCA/Galerkin coarsening.
+        double* shmem =
+            reinterpret_cast< double* >( team.team_shmem().get_shmem( team_shmem_size( team.team_size() ) ) );
 
-    ///
+        using ScratchCoords =
+            Kokkos::View< double**, Kokkos::LayoutRight, typename Team::scratch_memory_space, Kokkos::MemoryUnmanaged >;
+        using ScratchSrc = Kokkos::
+            View< double***, Kokkos::LayoutRight, typename Team::scratch_memory_space, Kokkos::MemoryUnmanaged >;
+        using ScratchK =
+            Kokkos::View< double**, Kokkos::LayoutRight, typename Team::scratch_memory_space, Kokkos::MemoryUnmanaged >;
+
+        ScratchCoords coords_sh( shmem, nxy, 3 );
+        shmem += nxy * 3;
+
+        ScratchSrc src_sh( shmem, nxy, 3, nlev );
+        shmem += nxy * 3 * nlev;
+
+        ScratchK k_sh( shmem, nxy, nlev );
+        shmem += nxy * nlev;
+
+        auto r_sh =
+            Kokkos::View< double*, Kokkos::LayoutRight, typename Team::scratch_memory_space, Kokkos::MemoryUnmanaged >(
+                shmem, nlev );
+
+        auto node_id = [&]( int nx, int ny ) -> int { return nx + ( lat_tile_ + 1 ) * ny; };
+
+        Kokkos::parallel_for( Kokkos::TeamThreadRange( team, nxy ), [&]( int n ) {
+            const int dxn = n % ( lat_tile_ + 1 );
+            const int dyn = n / ( lat_tile_ + 1 );
+            const int xi  = x0 + dxn;
+            const int yi  = y0 + dyn;
+
+            if ( xi <= hex_lat_ && yi <= hex_lat_ )
+            {
+                coords_sh( n, 0 ) = grid_( local_subdomain_id, xi, yi, 0 );
+                coords_sh( n, 1 ) = grid_( local_subdomain_id, xi, yi, 1 );
+                coords_sh( n, 2 ) = grid_( local_subdomain_id, xi, yi, 2 );
+            }
+            else
+            {
+                coords_sh( n, 0 ) = coords_sh( n, 1 ) = coords_sh( n, 2 ) = 0.0;
+            }
+        } );
+
+        Kokkos::parallel_for( Kokkos::TeamThreadRange( team, nlev ), [&]( int lvl ) {
+            const int rr = r0 + lvl;
+            r_sh( lvl )  = ( rr <= hex_rad_ ) ? radii_( local_subdomain_id, rr ) : 0.0;
+        } );
+
+        const int total_pairs = nxy * nlev;
+        Kokkos::parallel_for( Kokkos::TeamThreadRange( team, total_pairs ), [&]( int t ) {
+            const int lvl  = t / nxy;
+            const int node = t - lvl * nxy;
+
+            const int dxn = node % ( lat_tile_ + 1 );
+            const int dyn = node / ( lat_tile_ + 1 );
+
+            const int xi = x0 + dxn;
+            const int yi = y0 + dyn;
+            const int rr = r0 + lvl;
+
+            if ( xi <= hex_lat_ && yi <= hex_lat_ && rr <= hex_rad_ )
+            {
+                k_sh( node, lvl )      = k_( local_subdomain_id, xi, yi, rr );
+                src_sh( node, 0, lvl ) = src_( local_subdomain_id, xi, yi, rr, 0 );
+                src_sh( node, 1, lvl ) = src_( local_subdomain_id, xi, yi, rr, 1 );
+                src_sh( node, 2, lvl ) = src_( local_subdomain_id, xi, yi, rr, 2 );
+            }
+            else
+            {
+                k_sh( node, lvl )      = 0.0;
+                src_sh( node, 0, lvl ) = src_sh( node, 1, lvl ) = src_sh( node, 2, lvl ) = 0.0;
+            }
+        } );
+
+        team.team_barrier();
+
+        if ( x_cell >= hex_lat_ || y_cell >= hex_lat_ || r_cell >= hex_rad_ )
+            return;
+
+        const int    lvl0 = tr;
+        const double r_0  = r_sh( lvl0 );
+        const double r_1  = r_sh( lvl0 + 1 );
+
+        const bool at_boundary              = at_cmb || at_surface;
+        bool       treat_boundary_dirichlet = false;
+        if ( at_boundary )
+        {
+            const ShellBoundaryFlag sbf = at_cmb ? CMB : SURFACE;
+            treat_boundary_dirichlet    = ( get_boundary_condition_flag( bcs_, sbf ) == DIRICHLET );
+        }
+
+        const int cmb_shift = ( ( at_boundary && treat_boundary_dirichlet && ( !diagonal_ ) && at_cmb ) ? 3 : 0 );
+        const int surface_shift =
+            ( ( at_boundary && treat_boundary_dirichlet && ( !diagonal_ ) && at_surface ) ? 3 : 0 );
+
+        static constexpr int WEDGE_NODE_OFF[2][6][3] = {
+            { { 0, 0, 0 }, { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 }, { 1, 0, 1 }, { 0, 1, 1 } },
+            { { 1, 1, 0 }, { 0, 1, 0 }, { 1, 0, 0 }, { 1, 1, 1 }, { 0, 1, 1 }, { 1, 0, 1 } } };
+
+        static constexpr int WEDGE_TO_UNIQUE[2][6] = {
+            { 0, 1, 2, 3, 4, 5 },
+            { 6, 2, 1, 7, 5, 4 }
+        };
+
+        constexpr double ONE_THIRD      = 1.0 / 3.0;
+        constexpr double ONE_SIXTH      = 1.0 / 6.0;
+        constexpr double NEG_TWO_THIRDS = -0.66666666666666663;
+
+        static constexpr double dN_ref[6][3] = {
+            { -0.5, -0.5, -ONE_SIXTH },
+            { 0.5, 0.0, -ONE_SIXTH },
+            { 0.0, 0.5, -ONE_SIXTH },
+            { -0.5, -0.5, ONE_SIXTH },
+            { 0.5, 0.0, ONE_SIXTH },
+            { 0.0, 0.5, ONE_SIXTH } };
+
+        const int n00 = node_id( tx, ty );
+        const int n01 = node_id( tx, ty + 1 );
+        const int n10 = node_id( tx + 1, ty );
+        const int n11 = node_id( tx + 1, ty + 1 );
+
+        double ws[2][3][3];
+
+        ws[0][0][0] = coords_sh( n00, 0 );
+        ws[0][0][1] = coords_sh( n00, 1 );
+        ws[0][0][2] = coords_sh( n00, 2 );
+        ws[0][1][0] = coords_sh( n10, 0 );
+        ws[0][1][1] = coords_sh( n10, 1 );
+        ws[0][1][2] = coords_sh( n10, 2 );
+        ws[0][2][0] = coords_sh( n01, 0 );
+        ws[0][2][1] = coords_sh( n01, 1 );
+        ws[0][2][2] = coords_sh( n01, 2 );
+
+        ws[1][0][0] = coords_sh( n11, 0 );
+        ws[1][0][1] = coords_sh( n11, 1 );
+        ws[1][0][2] = coords_sh( n11, 2 );
+        ws[1][1][0] = coords_sh( n01, 0 );
+        ws[1][1][1] = coords_sh( n01, 1 );
+        ws[1][1][2] = coords_sh( n01, 2 );
+        ws[1][2][0] = coords_sh( n10, 0 );
+        ws[1][2][1] = coords_sh( n10, 1 );
+        ws[1][2][2] = coords_sh( n10, 2 );
+
+        double dst8[3][8] = { 0.0 };
+
+        for ( int w = 0; w < 2; ++w )
+        {
+            double k_sum = 0.0;
+#pragma unroll
+            for ( int node = 0; node < 6; ++node )
+            {
+                const int ddx = WEDGE_NODE_OFF[w][node][0];
+                const int ddy = WEDGE_NODE_OFF[w][node][1];
+                const int ddr = WEDGE_NODE_OFF[w][node][2];
+
+                const int nid = node_id( tx + ddx, ty + ddy );
+                const int lvl = lvl0 + ddr;
+
+                k_sum += k_sh( nid, lvl );
+            }
+            const double k_eval = ONE_SIXTH * k_sum;
+
+            double wJ = 0.0;
+            double i00, i01, i02;
+            double i10, i11, i12;
+            double i20, i21, i22;
+
+            {
+                const double half_dr = 0.5 * ( r_1 - r_0 );
+                const double r_mid   = 0.5 * ( r_0 + r_1 );
+
+                const double J_0_0 = r_mid * ( -ws[w][0][0] + ws[w][1][0] );
+                const double J_0_1 = r_mid * ( -ws[w][0][0] + ws[w][2][0] );
+                const double J_0_2 = half_dr * ( ONE_THIRD * ( ws[w][0][0] + ws[w][1][0] + ws[w][2][0] ) );
+
+                const double J_1_0 = r_mid * ( -ws[w][0][1] + ws[w][1][1] );
+                const double J_1_1 = r_mid * ( -ws[w][0][1] + ws[w][2][1] );
+                const double J_1_2 = half_dr * ( ONE_THIRD * ( ws[w][0][1] + ws[w][1][1] + ws[w][2][1] ) );
+
+                const double J_2_0 = r_mid * ( -ws[w][0][2] + ws[w][1][2] );
+                const double J_2_1 = r_mid * ( -ws[w][0][2] + ws[w][2][2] );
+                const double J_2_2 = half_dr * ( ONE_THIRD * ( ws[w][0][2] + ws[w][1][2] + ws[w][2][2] ) );
+
+                const double J_det = J_0_0 * J_1_1 * J_2_2 - J_0_0 * J_1_2 * J_2_1 - J_0_1 * J_1_0 * J_2_2 +
+                                     J_0_1 * J_1_2 * J_2_0 + J_0_2 * J_1_0 * J_2_1 - J_0_2 * J_1_1 * J_2_0;
+
+                const double invJ = 1.0 / J_det;
+
+                i00 = invJ * ( J_1_1 * J_2_2 - J_1_2 * J_2_1 );
+                i01 = invJ * ( -J_1_0 * J_2_2 + J_1_2 * J_2_0 );
+                i02 = invJ * ( J_1_0 * J_2_1 - J_1_1 * J_2_0 );
+                i10 = invJ * ( -J_0_1 * J_2_2 + J_0_2 * J_2_1 );
+                i11 = invJ * ( J_0_0 * J_2_2 - J_0_2 * J_2_0 );
+                i12 = invJ * ( -J_0_0 * J_2_1 + J_0_1 * J_2_0 );
+                i20 = invJ * ( J_0_1 * J_1_2 - J_0_2 * J_1_1 );
+                i21 = invJ * ( -J_0_0 * J_1_2 + J_0_2 * J_1_0 );
+                i22 = invJ * ( J_0_0 * J_1_1 - J_0_1 * J_1_0 );
+
+                wJ = Kokkos::abs( J_det );
+            }
+
+            const double kwJ = k_eval * wJ;
+
+            double gu00 = 0.0;
+            double gu10 = 0.0, gu11 = 0.0;
+            double gu20 = 0.0, gu21 = 0.0, gu22 = 0.0;
+            double div_u = 0.0;
+
+            if ( !diagonal_ )
+            {
+                for ( int dimj = 0; dimj < 3; ++dimj )
+                {
+#pragma unroll
+                    for ( int node_idx = cmb_shift; node_idx < 6 - surface_shift; ++node_idx )
+                    {
+                        const double gx = dN_ref[node_idx][0];
+                        const double gy = dN_ref[node_idx][1];
+                        const double gz = dN_ref[node_idx][2];
+
+                        const double g0 = i00 * gx + i01 * gy + i02 * gz;
+                        const double g1 = i10 * gx + i11 * gy + i12 * gz;
+                        const double g2 = i20 * gx + i21 * gy + i22 * gz;
+
+                        double E00, E11, E22, sym01, sym02, sym12, gdd;
+                        column_grad_to_sym( dimj, g0, g1, g2, E00, E11, E22, sym01, sym02, sym12, gdd );
+
+                        const int ddx = WEDGE_NODE_OFF[w][node_idx][0];
+                        const int ddy = WEDGE_NODE_OFF[w][node_idx][1];
+                        const int ddr = WEDGE_NODE_OFF[w][node_idx][2];
+
+                        const int nid = node_id( tx + ddx, ty + ddy );
+                        const int lvl = lvl0 + ddr;
+
+                        const double s = src_sh( nid, dimj, lvl );
+
+                        gu00 += E00 * s;
+                        gu10 += sym01 * s;
+                        gu11 += E11 * s;
+                        gu20 += sym02 * s;
+                        gu21 += sym12 * s;
+                        gu22 += E22 * s;
+                        div_u += gdd * s;
+                    }
+                }
+
+                for ( int dimi = 0; dimi < 3; ++dimi )
+                {
+#pragma unroll
+                    for ( int node_idx = cmb_shift; node_idx < 6 - surface_shift; ++node_idx )
+                    {
+                        const double gx = dN_ref[node_idx][0];
+                        const double gy = dN_ref[node_idx][1];
+                        const double gz = dN_ref[node_idx][2];
+
+                        const double g0 = i00 * gx + i01 * gy + i02 * gz;
+                        const double g1 = i10 * gx + i11 * gy + i12 * gz;
+                        const double g2 = i20 * gx + i21 * gy + i22 * gz;
+
+                        double E00, E11, E22, sym01, sym02, sym12, gdd;
+                        column_grad_to_sym( dimi, g0, g1, g2, E00, E11, E22, sym01, sym02, sym12, gdd );
+
+                        const int u = WEDGE_TO_UNIQUE[w][node_idx];
+
+                        dst8[dimi][u] +=
+                            kwJ * ( NEG_TWO_THIRDS * div_u * gdd + 4.0 * sym01 * gu10 + 4.0 * sym02 * gu20 +
+                                    4.0 * sym12 * gu21 + 2.0 * E00 * gu00 + 2.0 * E11 * gu11 + 2.0 * E22 * gu22 );
+                    }
+                }
+            }
+
+            if ( diagonal_ || ( treat_boundary_dirichlet && at_boundary ) )
+            {
+                for ( int dim_diagBC = 0; dim_diagBC < 3; ++dim_diagBC )
+                {
+#pragma unroll
+                    for ( int node_idx = surface_shift; node_idx < 6 - cmb_shift; ++node_idx )
+                    {
+                        const double gx = dN_ref[node_idx][0];
+                        const double gy = dN_ref[node_idx][1];
+                        const double gz = dN_ref[node_idx][2];
+
+                        const double g0 = i00 * gx + i01 * gy + i02 * gz;
+                        const double g1 = i10 * gx + i11 * gy + i12 * gz;
+                        const double g2 = i20 * gx + i21 * gy + i22 * gz;
+
+                        double E00, E11, E22, sym01, sym02, sym12, gdd;
+                        column_grad_to_sym( dim_diagBC, g0, g1, g2, E00, E11, E22, sym01, sym02, sym12, gdd );
+
+                        const int ddx = WEDGE_NODE_OFF[w][node_idx][0];
+                        const int ddy = WEDGE_NODE_OFF[w][node_idx][1];
+                        const int ddr = WEDGE_NODE_OFF[w][node_idx][2];
+
+                        const int nid = node_id( tx + ddx, ty + ddy );
+                        const int lvl = lvl0 + ddr;
+
+                        const double s = src_sh( nid, dim_diagBC, lvl );
+                        const int    u = WEDGE_TO_UNIQUE[w][node_idx];
+
+                        dst8[dim_diagBC][u] += kwJ * ( 4.0 * s * ( sym01 * sym01 + sym02 * sym02 + sym12 * sym12 ) +
+                                                       2.0 * s * ( E00 * E00 + E11 * E11 + E22 * E22 ) +
+                                                       NEG_TWO_THIRDS * ( gdd * gdd ) * s );
+                    }
+                }
+            }
+        }
+
+        for ( int dim_add = 0; dim_add < 3; ++dim_add )
+        {
+            Kokkos::atomic_add( &dst_( local_subdomain_id, x_cell, y_cell, r_cell, dim_add ), dst8[dim_add][0] );
+            Kokkos::atomic_add( &dst_( local_subdomain_id, x_cell + 1, y_cell, r_cell, dim_add ), dst8[dim_add][1] );
+            Kokkos::atomic_add( &dst_( local_subdomain_id, x_cell, y_cell + 1, r_cell, dim_add ), dst8[dim_add][2] );
+            Kokkos::atomic_add( &dst_( local_subdomain_id, x_cell, y_cell, r_cell + 1, dim_add ), dst8[dim_add][3] );
+            Kokkos::atomic_add(
+                &dst_( local_subdomain_id, x_cell + 1, y_cell, r_cell + 1, dim_add ), dst8[dim_add][4] );
+            Kokkos::atomic_add(
+                &dst_( local_subdomain_id, x_cell, y_cell + 1, r_cell + 1, dim_add ), dst8[dim_add][5] );
+            Kokkos::atomic_add(
+                &dst_( local_subdomain_id, x_cell + 1, y_cell + 1, r_cell, dim_add ), dst8[dim_add][6] );
+            Kokkos::atomic_add(
+                &dst_( local_subdomain_id, x_cell + 1, y_cell + 1, r_cell + 1, dim_add ), dst8[dim_add][7] );
+        }
+    }
+
+    // ===================== FAST FREESLIP PATH =====================
+    KOKKOS_INLINE_FUNCTION
+    void normalize3( double& x, double& y, double& z ) const
+    {
+        const double n2 = x * x + y * y + z * z;
+        if ( n2 > 0.0 )
+        {
+            const double invn = 1.0 / Kokkos::sqrt( n2 );
+            x *= invn;
+            y *= invn;
+            z *= invn;
+        }
+    }
+
+    KOKKOS_INLINE_FUNCTION
+    void project_tangential_inplace(
+        const double nx,
+        const double ny,
+        const double nz,
+        double&      ux,
+        double&      uy,
+        double&      uz ) const
+    {
+        const double dot = nx * ux + ny * uy + nz * uz;
+        ux -= dot * nx;
+        uy -= dot * ny;
+        uz -= dot * nz;
+    }
+
+    KOKKOS_INLINE_FUNCTION
+    void operator_fast_freeslip_path(
+        const Team& team,
+        const int   local_subdomain_id,
+        const int   x0,
+        const int   y0,
+        const int   r0,
+        const int   tx,
+        const int   ty,
+        const int   tr,
+        const int   x_cell,
+        const int   y_cell,
+        const int   r_cell,
+        const bool  at_cmb,
+        const bool  at_surface ) const
+    {
+        const int nlev = r_tile_ + 1;
+        const int nxy  = ( lat_tile_ + 1 ) * ( lat_tile_ + 1 );
+
+        double* shmem =
+            reinterpret_cast< double* >( team.team_shmem().get_shmem( team_shmem_size( team.team_size() ) ) );
+
+        using ScratchCoords =
+            Kokkos::View< double**, Kokkos::LayoutRight, typename Team::scratch_memory_space, Kokkos::MemoryUnmanaged >;
+        using ScratchSrc = Kokkos::
+            View< double***, Kokkos::LayoutRight, typename Team::scratch_memory_space, Kokkos::MemoryUnmanaged >;
+        using ScratchK =
+            Kokkos::View< double**, Kokkos::LayoutRight, typename Team::scratch_memory_space, Kokkos::MemoryUnmanaged >;
+
+        ScratchCoords coords_sh( shmem, nxy, 3 );
+        shmem += nxy * 3;
+
+        ScratchSrc src_sh( shmem, nxy, 3, nlev );
+        shmem += nxy * 3 * nlev;
+
+        ScratchK k_sh( shmem, nxy, nlev );
+        shmem += nxy * nlev;
+
+        auto r_sh =
+            Kokkos::View< double*, Kokkos::LayoutRight, typename Team::scratch_memory_space, Kokkos::MemoryUnmanaged >(
+                shmem, nlev );
+
+        auto node_id = [&]( int nx, int ny ) -> int { return nx + ( lat_tile_ + 1 ) * ny; };
+
+        Kokkos::parallel_for( Kokkos::TeamThreadRange( team, nxy ), [&]( int n ) {
+            const int dxn = n % ( lat_tile_ + 1 );
+            const int dyn = n / ( lat_tile_ + 1 );
+            const int xi  = x0 + dxn;
+            const int yi  = y0 + dyn;
+
+            if ( xi <= hex_lat_ && yi <= hex_lat_ )
+            {
+                coords_sh( n, 0 ) = grid_( local_subdomain_id, xi, yi, 0 );
+                coords_sh( n, 1 ) = grid_( local_subdomain_id, xi, yi, 1 );
+                coords_sh( n, 2 ) = grid_( local_subdomain_id, xi, yi, 2 );
+            }
+            else
+            {
+                coords_sh( n, 0 ) = coords_sh( n, 1 ) = coords_sh( n, 2 ) = 0.0;
+            }
+        } );
+
+        Kokkos::parallel_for( Kokkos::TeamThreadRange( team, nlev ), [&]( int lvl ) {
+            const int rr = r0 + lvl;
+            r_sh( lvl )  = ( rr <= hex_rad_ ) ? radii_( local_subdomain_id, rr ) : 0.0;
+        } );
+
+        const int total_pairs = nxy * nlev;
+        Kokkos::parallel_for( Kokkos::TeamThreadRange( team, total_pairs ), [&]( int t ) {
+            const int lvl  = t / nxy;
+            const int node = t - lvl * nxy;
+
+            const int dxn = node % ( lat_tile_ + 1 );
+            const int dyn = node / ( lat_tile_ + 1 );
+
+            const int xi = x0 + dxn;
+            const int yi = y0 + dyn;
+            const int rr = r0 + lvl;
+
+            if ( xi <= hex_lat_ && yi <= hex_lat_ && rr <= hex_rad_ )
+            {
+                k_sh( node, lvl )      = k_( local_subdomain_id, xi, yi, rr );
+                src_sh( node, 0, lvl ) = src_( local_subdomain_id, xi, yi, rr, 0 );
+                src_sh( node, 1, lvl ) = src_( local_subdomain_id, xi, yi, rr, 1 );
+                src_sh( node, 2, lvl ) = src_( local_subdomain_id, xi, yi, rr, 2 );
+            }
+            else
+            {
+                k_sh( node, lvl )      = 0.0;
+                src_sh( node, 0, lvl ) = src_sh( node, 1, lvl ) = src_sh( node, 2, lvl ) = 0.0;
+            }
+        } );
+
+        team.team_barrier();
+
+        if ( x_cell >= hex_lat_ || y_cell >= hex_lat_ || r_cell >= hex_rad_ )
+            return;
+
+        const int    lvl0 = tr;
+        const double r_0  = r_sh( lvl0 );
+        const double r_1  = r_sh( lvl0 + 1 );
+
+        const BoundaryConditionFlag cmb_bc     = get_boundary_condition_flag( bcs_, CMB );
+        const BoundaryConditionFlag surface_bc = get_boundary_condition_flag( bcs_, SURFACE );
+
+        const bool cmb_freeslip      = at_cmb && ( cmb_bc == FREESLIP );
+        const bool surf_freeslip     = at_surface && ( surface_bc == FREESLIP );
+        const bool cmb_dirichlet     = at_cmb && ( cmb_bc == DIRICHLET );
+        const bool surface_dirichlet = at_surface && ( surface_bc == DIRICHLET );
+
+        const int cmb_shift     = ( ( cmb_dirichlet && ( !diagonal_ ) ) ? 3 : 0 );
+        const int surface_shift = ( ( surface_dirichlet && ( !diagonal_ ) ) ? 3 : 0 );
+
+        static constexpr int WEDGE_NODE_OFF[2][6][3] = {
+            { { 0, 0, 0 }, { 1, 0, 0 }, { 0, 1, 0 }, { 0, 0, 1 }, { 1, 0, 1 }, { 0, 1, 1 } },
+            { { 1, 1, 0 }, { 0, 1, 0 }, { 1, 0, 0 }, { 1, 1, 1 }, { 0, 1, 1 }, { 1, 0, 1 } } };
+
+        static constexpr int WEDGE_TO_UNIQUE[2][6] = {
+            { 0, 1, 2, 3, 4, 5 },
+            { 6, 2, 1, 7, 5, 4 }
+        };
+
+        constexpr double ONE_THIRD      = 1.0 / 3.0;
+        constexpr double ONE_SIXTH      = 1.0 / 6.0;
+        constexpr double NEG_TWO_THIRDS = -0.66666666666666663;
+
+        static constexpr double dN_ref[6][3] = {
+            { -0.5, -0.5, -ONE_SIXTH },
+            { 0.5, 0.0, -ONE_SIXTH },
+            { 0.0, 0.5, -ONE_SIXTH },
+            { -0.5, -0.5, ONE_SIXTH },
+            { 0.5, 0.0, ONE_SIXTH },
+            { 0.0, 0.5, ONE_SIXTH } };
+
+        const int n00 = node_id( tx, ty );
+        const int n01 = node_id( tx, ty + 1 );
+        const int n10 = node_id( tx + 1, ty );
+        const int n11 = node_id( tx + 1, ty + 1 );
+
+        double ws[2][3][3];
+
+        ws[0][0][0] = coords_sh( n00, 0 );
+        ws[0][0][1] = coords_sh( n00, 1 );
+        ws[0][0][2] = coords_sh( n00, 2 );
+        ws[0][1][0] = coords_sh( n10, 0 );
+        ws[0][1][1] = coords_sh( n10, 1 );
+        ws[0][1][2] = coords_sh( n10, 2 );
+        ws[0][2][0] = coords_sh( n01, 0 );
+        ws[0][2][1] = coords_sh( n01, 1 );
+        ws[0][2][2] = coords_sh( n01, 2 );
+
+        ws[1][0][0] = coords_sh( n11, 0 );
+        ws[1][0][1] = coords_sh( n11, 1 );
+        ws[1][0][2] = coords_sh( n11, 2 );
+        ws[1][1][0] = coords_sh( n01, 0 );
+        ws[1][1][1] = coords_sh( n01, 1 );
+        ws[1][1][2] = coords_sh( n01, 2 );
+        ws[1][2][0] = coords_sh( n10, 0 );
+        ws[1][2][1] = coords_sh( n10, 1 );
+        ws[1][2][2] = coords_sh( n10, 2 );
+
+        double src8[3][8];
+
+        src8[0][0] = src_sh( n00, 0, lvl0 );
+        src8[1][0] = src_sh( n00, 1, lvl0 );
+        src8[2][0] = src_sh( n00, 2, lvl0 );
+        src8[0][1] = src_sh( n10, 0, lvl0 );
+        src8[1][1] = src_sh( n10, 1, lvl0 );
+        src8[2][1] = src_sh( n10, 2, lvl0 );
+        src8[0][2] = src_sh( n01, 0, lvl0 );
+        src8[1][2] = src_sh( n01, 1, lvl0 );
+        src8[2][2] = src_sh( n01, 2, lvl0 );
+        src8[0][6] = src_sh( n11, 0, lvl0 );
+        src8[1][6] = src_sh( n11, 1, lvl0 );
+        src8[2][6] = src_sh( n11, 2, lvl0 );
+
+        src8[0][3] = src_sh( n00, 0, lvl0 + 1 );
+        src8[1][3] = src_sh( n00, 1, lvl0 + 1 );
+        src8[2][3] = src_sh( n00, 2, lvl0 + 1 );
+        src8[0][4] = src_sh( n10, 0, lvl0 + 1 );
+        src8[1][4] = src_sh( n10, 1, lvl0 + 1 );
+        src8[2][4] = src_sh( n10, 2, lvl0 + 1 );
+        src8[0][5] = src_sh( n01, 0, lvl0 + 1 );
+        src8[1][5] = src_sh( n01, 1, lvl0 + 1 );
+        src8[2][5] = src_sh( n01, 2, lvl0 + 1 );
+        src8[0][7] = src_sh( n11, 0, lvl0 + 1 );
+        src8[1][7] = src_sh( n11, 1, lvl0 + 1 );
+        src8[2][7] = src_sh( n11, 2, lvl0 + 1 );
+
+        double nx00 = coords_sh( n00, 0 ), ny00 = coords_sh( n00, 1 ), nz00 = coords_sh( n00, 2 );
+        double nx10 = coords_sh( n10, 0 ), ny10 = coords_sh( n10, 1 ), nz10 = coords_sh( n10, 2 );
+        double nx01 = coords_sh( n01, 0 ), ny01 = coords_sh( n01, 1 ), nz01 = coords_sh( n01, 2 );
+        double nx11 = coords_sh( n11, 0 ), ny11 = coords_sh( n11, 1 ), nz11 = coords_sh( n11, 2 );
+
+        normalize3( nx00, ny00, nz00 );
+        normalize3( nx10, ny10, nz10 );
+        normalize3( nx01, ny01, nz01 );
+        normalize3( nx11, ny11, nz11 );
+
+        if ( cmb_freeslip )
+        {
+            project_tangential_inplace( nx00, ny00, nz00, src8[0][0], src8[1][0], src8[2][0] );
+            project_tangential_inplace( nx10, ny10, nz10, src8[0][1], src8[1][1], src8[2][1] );
+            project_tangential_inplace( nx01, ny01, nz01, src8[0][2], src8[1][2], src8[2][2] );
+            project_tangential_inplace( nx11, ny11, nz11, src8[0][6], src8[1][6], src8[2][6] );
+        }
+        if ( surf_freeslip )
+        {
+            project_tangential_inplace( nx00, ny00, nz00, src8[0][3], src8[1][3], src8[2][3] );
+            project_tangential_inplace( nx10, ny10, nz10, src8[0][4], src8[1][4], src8[2][4] );
+            project_tangential_inplace( nx01, ny01, nz01, src8[0][5], src8[1][5], src8[2][5] );
+            project_tangential_inplace( nx11, ny11, nz11, src8[0][7], src8[1][7], src8[2][7] );
+        }
+
+        double dst8[3][8] = { { 0.0 } };
+
+        for ( int w = 0; w < 2; ++w )
+        {
+            double k_sum = 0.0;
+#pragma unroll
+            for ( int node = 0; node < 6; ++node )
+            {
+                const int ddx = WEDGE_NODE_OFF[w][node][0];
+                const int ddy = WEDGE_NODE_OFF[w][node][1];
+                const int ddr = WEDGE_NODE_OFF[w][node][2];
+
+                const int nid = node_id( tx + ddx, ty + ddy );
+                const int lvl = lvl0 + ddr;
+                k_sum += k_sh( nid, lvl );
+            }
+            const double k_eval = ONE_SIXTH * k_sum;
+
+            double wJ = 0.0;
+            double i00, i01, i02;
+            double i10, i11, i12;
+            double i20, i21, i22;
+
+            {
+                const double half_dr = 0.5 * ( r_1 - r_0 );
+                const double r_mid   = 0.5 * ( r_0 + r_1 );
+
+                const double J_0_0 = r_mid * ( -ws[w][0][0] + ws[w][1][0] );
+                const double J_0_1 = r_mid * ( -ws[w][0][0] + ws[w][2][0] );
+                const double J_0_2 = half_dr * ( ONE_THIRD * ( ws[w][0][0] + ws[w][1][0] + ws[w][2][0] ) );
+
+                const double J_1_0 = r_mid * ( -ws[w][0][1] + ws[w][1][1] );
+                const double J_1_1 = r_mid * ( -ws[w][0][1] + ws[w][2][1] );
+                const double J_1_2 = half_dr * ( ONE_THIRD * ( ws[w][0][1] + ws[w][1][1] + ws[w][2][1] ) );
+
+                const double J_2_0 = r_mid * ( -ws[w][0][2] + ws[w][1][2] );
+                const double J_2_1 = r_mid * ( -ws[w][0][2] + ws[w][2][2] );
+                const double J_2_2 = half_dr * ( ONE_THIRD * ( ws[w][0][2] + ws[w][1][2] + ws[w][2][2] ) );
+
+                const double J_det = J_0_0 * J_1_1 * J_2_2 - J_0_0 * J_1_2 * J_2_1 - J_0_1 * J_1_0 * J_2_2 +
+                                     J_0_1 * J_1_2 * J_2_0 + J_0_2 * J_1_0 * J_2_1 - J_0_2 * J_1_1 * J_2_0;
+
+                const double invJ = 1.0 / J_det;
+
+                i00 = invJ * ( J_1_1 * J_2_2 - J_1_2 * J_2_1 );
+                i01 = invJ * ( -J_1_0 * J_2_2 + J_1_2 * J_2_0 );
+                i02 = invJ * ( J_1_0 * J_2_1 - J_1_1 * J_2_0 );
+
+                i10 = invJ * ( -J_0_1 * J_2_2 + J_0_2 * J_2_1 );
+                i11 = invJ * ( J_0_0 * J_2_2 - J_0_2 * J_2_0 );
+                i12 = invJ * ( -J_0_0 * J_2_1 + J_0_1 * J_2_0 );
+
+                i20 = invJ * ( J_0_1 * J_1_2 - J_0_2 * J_1_1 );
+                i21 = invJ * ( -J_0_0 * J_1_2 + J_0_2 * J_1_0 );
+                i22 = invJ * ( J_0_0 * J_1_1 - J_0_1 * J_1_0 );
+
+                wJ = Kokkos::abs( J_det );
+            }
+
+            const double kwJ = k_eval * wJ;
+
+            double gu00 = 0.0;
+            double gu10 = 0.0, gu11 = 0.0;
+            double gu20 = 0.0, gu21 = 0.0, gu22 = 0.0;
+            double div_u = 0.0;
+
+            if ( !diagonal_ )
+            {
+                for ( int dimj = 0; dimj < 3; ++dimj )
+                {
+#pragma unroll
+                    for ( int node_idx = cmb_shift; node_idx < 6 - surface_shift; ++node_idx )
+                    {
+                        const double gx = dN_ref[node_idx][0];
+                        const double gy = dN_ref[node_idx][1];
+                        const double gz = dN_ref[node_idx][2];
+
+                        const double g0 = i00 * gx + i01 * gy + i02 * gz;
+                        const double g1 = i10 * gx + i11 * gy + i12 * gz;
+                        const double g2 = i20 * gx + i21 * gy + i22 * gz;
+
+                        double E00, E11, E22, sym01, sym02, sym12, gdd;
+                        column_grad_to_sym( dimj, g0, g1, g2, E00, E11, E22, sym01, sym02, sym12, gdd );
+
+                        const int    u = WEDGE_TO_UNIQUE[w][node_idx];
+                        const double s = src8[dimj][u];
+
+                        gu00 += E00 * s;
+                        gu10 += sym01 * s;
+                        gu11 += E11 * s;
+                        gu20 += sym02 * s;
+                        gu21 += sym12 * s;
+                        gu22 += E22 * s;
+                        div_u += gdd * s;
+                    }
+                }
+
+                for ( int dimi = 0; dimi < 3; ++dimi )
+                {
+#pragma unroll
+                    for ( int node_idx = cmb_shift; node_idx < 6 - surface_shift; ++node_idx )
+                    {
+                        const double gx = dN_ref[node_idx][0];
+                        const double gy = dN_ref[node_idx][1];
+                        const double gz = dN_ref[node_idx][2];
+
+                        const double g0 = i00 * gx + i01 * gy + i02 * gz;
+                        const double g1 = i10 * gx + i11 * gy + i12 * gz;
+                        const double g2 = i20 * gx + i21 * gy + i22 * gz;
+
+                        double E00, E11, E22, sym01, sym02, sym12, gdd;
+                        column_grad_to_sym( dimi, g0, g1, g2, E00, E11, E22, sym01, sym02, sym12, gdd );
+
+                        const int u = WEDGE_TO_UNIQUE[w][node_idx];
+
+                        dst8[dimi][u] +=
+                            kwJ * ( NEG_TWO_THIRDS * div_u * gdd + 4.0 * sym01 * gu10 + 4.0 * sym02 * gu20 +
+                                    4.0 * sym12 * gu21 + 2.0 * E00 * gu00 + 2.0 * E11 * gu11 + 2.0 * E22 * gu22 );
+                    }
+                }
+            }
+
+            if ( diagonal_ || cmb_dirichlet || surface_dirichlet )
+            {
+                for ( int dim_diagBC = 0; dim_diagBC < 3; ++dim_diagBC )
+                {
+#pragma unroll
+                    for ( int node_idx = surface_shift; node_idx < 6 - cmb_shift; ++node_idx )
+                    {
+                        const double gx = dN_ref[node_idx][0];
+                        const double gy = dN_ref[node_idx][1];
+                        const double gz = dN_ref[node_idx][2];
+
+                        const double g0 = i00 * gx + i01 * gy + i02 * gz;
+                        const double g1 = i10 * gx + i11 * gy + i12 * gz;
+                        const double g2 = i20 * gx + i21 * gy + i22 * gz;
+
+                        double E00, E11, E22, sym01, sym02, sym12, gdd;
+                        column_grad_to_sym( dim_diagBC, g0, g1, g2, E00, E11, E22, sym01, sym02, sym12, gdd );
+
+                        const int    u = WEDGE_TO_UNIQUE[w][node_idx];
+                        const double s = src8[dim_diagBC][u];
+
+                        dst8[dim_diagBC][u] += kwJ * ( 4.0 * s * ( sym01 * sym01 + sym02 * sym02 + sym12 * sym12 ) +
+                                                       2.0 * s * ( E00 * E00 + E11 * E11 + E22 * E22 ) +
+                                                       NEG_TWO_THIRDS * ( gdd * gdd ) * s );
+                    }
+                }
+            }
+        }
+
+        // Test-side projection for free-slip (P A P)
+        if ( cmb_freeslip )
+        {
+            project_tangential_inplace( nx00, ny00, nz00, dst8[0][0], dst8[1][0], dst8[2][0] );
+            project_tangential_inplace( nx10, ny10, nz10, dst8[0][1], dst8[1][1], dst8[2][1] );
+            project_tangential_inplace( nx01, ny01, nz01, dst8[0][2], dst8[1][2], dst8[2][2] );
+            project_tangential_inplace( nx11, ny11, nz11, dst8[0][6], dst8[1][6], dst8[2][6] );
+        }
+        if ( surf_freeslip )
+        {
+            project_tangential_inplace( nx00, ny00, nz00, dst8[0][3], dst8[1][3], dst8[2][3] );
+            project_tangential_inplace( nx10, ny10, nz10, dst8[0][4], dst8[1][4], dst8[2][4] );
+            project_tangential_inplace( nx01, ny01, nz01, dst8[0][5], dst8[1][5], dst8[2][5] );
+            project_tangential_inplace( nx11, ny11, nz11, dst8[0][7], dst8[1][7], dst8[2][7] );
+        }
+
+        for ( int dim_add = 0; dim_add < 3; ++dim_add )
+        {
+            Kokkos::atomic_add( &dst_( local_subdomain_id, x_cell, y_cell, r_cell, dim_add ), dst8[dim_add][0] );
+            Kokkos::atomic_add( &dst_( local_subdomain_id, x_cell + 1, y_cell, r_cell, dim_add ), dst8[dim_add][1] );
+            Kokkos::atomic_add( &dst_( local_subdomain_id, x_cell, y_cell + 1, r_cell, dim_add ), dst8[dim_add][2] );
+            Kokkos::atomic_add( &dst_( local_subdomain_id, x_cell, y_cell, r_cell + 1, dim_add ), dst8[dim_add][3] );
+            Kokkos::atomic_add(
+                &dst_( local_subdomain_id, x_cell + 1, y_cell, r_cell + 1, dim_add ), dst8[dim_add][4] );
+            Kokkos::atomic_add(
+                &dst_( local_subdomain_id, x_cell, y_cell + 1, r_cell + 1, dim_add ), dst8[dim_add][5] );
+            Kokkos::atomic_add(
+                &dst_( local_subdomain_id, x_cell + 1, y_cell + 1, r_cell, dim_add ), dst8[dim_add][6] );
+            Kokkos::atomic_add(
+                &dst_( local_subdomain_id, x_cell + 1, y_cell + 1, r_cell + 1, dim_add ), dst8[dim_add][7] );
+        }
+    }
+
+  public:
+    /**
+     * @brief Legacy generic team operator.
+     *
+     * Kept for compatibility/debugging, but no longer used by apply_impl().
+     * The host now dispatches directly to path-specific kernels.
+     *
+     * This function still works, but it reintroduces a branch on `kernel_path_`
+     * and should therefore be avoided in performance-critical use.
+     */
+    KOKKOS_INLINE_FUNCTION
+    void operator()( const Team& team ) const
+    {
+        int local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell;
+        decode_team_indices( team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell );
+
+        if ( tr >= r_tile_ )
+            return;
+
+        const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
+        const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
+
+        if ( kernel_path_ == KernelPath::Slow )
+        {
+            operator_slow_path(
+                team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
+        }
+        else if ( kernel_path_ == KernelPath::FastFreeslip )
+        {
+            operator_fast_freeslip_path(
+                team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
+        }
+        else
+        {
+            operator_fast_dirichlet_neumann_path(
+                team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
+        }
+    }
+
     KOKKOS_INLINE_FUNCTION void assemble_trial_test_vecs(
         const int                               wedge,
         const dense::Vec< ScalarType, VecDim >& quad_point,
@@ -833,7 +1617,6 @@ class EpsilonDivDivKerngen
         const auto                                     abs_det = Kokkos::abs( det );
         const dense::Mat< ScalarType, VecDim, VecDim > J_inv_transposed = J.inv_transposed( det );
 
-        // dot of coeff dofs and element-local shape functions to evaluate the coefficent on the current element
         ScalarType k_eval = 0.0;
         for ( int k = 0; k < num_nodes_per_wedge; k++ )
         {
@@ -845,11 +1628,13 @@ class EpsilonDivDivKerngen
             sym_grad_i[k] = symmetric_grad( J_inv_transposed, quad_point, k, dimi );
             sym_grad_j[k] = symmetric_grad( J_inv_transposed, quad_point, k, dimj );
         }
+
         jdet_keval_quadweight = quad_weight * k_eval * abs_det;
     }
 
-    /// @brief assemble the local matrix and return it for a given element, wedge, and vectorial component
-    /// (determined by dimi, dimj)
+    /**
+     * @brief Assemble one wedge-local 18x18 matrix (slow path / on-demand assembly).
+     */
     KOKKOS_INLINE_FUNCTION
     dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > assemble_local_matrix(
         const int local_subdomain_id,
@@ -858,30 +1643,27 @@ class EpsilonDivDivKerngen
         const int r_cell,
         const int wedge ) const
     {
-        // Gather surface points for each wedge.
-        // TODO gather this for only 1 wedge
         dense::Vec< ScalarT, 3 > wedge_phy_surf[num_wedges_per_hex_cell][num_nodes_per_wedge_surface] = {};
         wedge_surface_physical_coords( wedge_phy_surf, grid_, local_subdomain_id, x_cell, y_cell );
 
-        // Gather wedge radii.
         const ScalarT r_1 = radii_( local_subdomain_id, r_cell );
         const ScalarT r_2 = radii_( local_subdomain_id, r_cell + 1 );
 
         dense::Vec< ScalarT, 6 > k_local_hex[num_wedges_per_hex_cell];
         extract_local_wedge_scalar_coefficients( k_local_hex, local_subdomain_id, x_cell, y_cell, r_cell, k_ );
 
-        // Compute the local element matrix.
         dense::Mat< ScalarT, LocalMatrixDim, LocalMatrixDim > A = {};
+
         for ( int dimi = 0; dimi < 3; ++dimi )
         {
             for ( int dimj = 0; dimj < 3; ++dimj )
             {
-                // spatial dimensions: quadrature points and wedge
                 for ( int q = 0; q < num_quad_points; q++ )
                 {
                     dense::Mat< ScalarType, VecDim, VecDim > sym_grad_i[num_nodes_per_wedge];
                     dense::Mat< ScalarType, VecDim, VecDim > sym_grad_j[num_nodes_per_wedge];
                     ScalarType                               jdet_keval_quadweight = 0;
+
                     assemble_trial_test_vecs(
                         wedge,
                         quad_points[q],
@@ -896,7 +1678,6 @@ class EpsilonDivDivKerngen
                         sym_grad_j,
                         jdet_keval_quadweight );
 
-                    // propagate on local matrix by outer product of test and trial vecs
                     for ( int i = 0; i < num_nodes_per_wedge; i++ )
                     {
                         for ( int j = 0; j < num_nodes_per_wedge; j++ )
@@ -905,18 +1686,14 @@ class EpsilonDivDivKerngen
                                 jdet_keval_quadweight *
                                 ( 2 * sym_grad_j[j].double_contract( sym_grad_i[i] ) -
                                   2.0 / 3.0 * sym_grad_j[j]( dimj, dimj ) * sym_grad_i[i]( dimi, dimi ) );
-                            // for the div, we just extract the component from the gradient vector
                         }
                     }
                 }
             }
         }
 
-      
-
         return A;
     }
-
 };
 
 static_assert( linalg::GCACapable< EpsilonDivDivKerngen< float > > );
