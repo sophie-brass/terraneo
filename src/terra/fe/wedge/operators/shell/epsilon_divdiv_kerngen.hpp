@@ -192,7 +192,7 @@ class EpsilonDivDivKerngen
 
         lat_tile_     = 4;
         r_tile_       = 8;
-        r_passes_     = 1;
+        r_passes_     = 2;
         r_tile_block_ = r_tile_ * r_passes_;
 
         lat_tiles_ = ( hex_lat_ + lat_tile_ - 1 ) / lat_tile_;
@@ -464,7 +464,7 @@ class EpsilonDivDivKerngen
     KOKKOS_INLINE_FUNCTION
     size_t team_shmem_size( const int ts ) const
     {
-        const int nlev = r_tile_ + 1;
+        const int nlev = r_tile_block_ + 1;
         const int n    = lat_tile_ + 1;
         const int nxy  = n * n;
 
@@ -561,11 +561,18 @@ class EpsilonDivDivKerngen
         if ( tr >= r_tile_ )
             return;
 
-        const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
-        const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
+        for ( int pass = 0; pass < r_passes_; ++pass )
+        {
+            const int r_cell_pass = r0 + pass * r_tile_ + tr;
+            if ( r_cell_pass >= hex_rad_ )
+                break;
 
-        operator_slow_path(
-            team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
+            const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell_pass, CMB );
+            const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell_pass + 1, SURFACE );
+
+            operator_slow_path(
+                team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell_pass, at_cmb, at_surface );
+        }
     }
 
     /**
@@ -604,11 +611,8 @@ class EpsilonDivDivKerngen
         if ( tr >= r_tile_ )
             return;
 
-        const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
-        const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
-
         operator_fast_freeslip_path< Diagonal >(
-            team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
+            team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell );
     }
 
     // ===================== SLOW PATH =====================
@@ -960,12 +964,13 @@ class EpsilonDivDivKerngen
         const int n10 = node_id( tx + 1, ty );
         const int n11 = node_id( tx + 1, ty + 1 );
 
+        for ( int pass = 0; pass < r_passes_; ++pass )
         {
-            const int lvl0   = tr;
-            const int r_cell = r0 + tr;
+            const int lvl0   = pass * r_tile_ + tr;
+            const int r_cell = r0 + lvl0;
 
             if ( r_cell >= hex_rad_ )
-                return;
+                break;
 
             const double r_0 = r_sh( lvl0 );
             const double r_1 = r_sh( lvl0 + 1 );
@@ -1227,12 +1232,9 @@ class EpsilonDivDivKerngen
         const int   ty,
         const int   tr,
         const int   x_cell,
-        const int   y_cell,
-        const int   r_cell,
-        const bool  at_cmb,
-        const bool  at_surface ) const
+        const int   y_cell ) const
     {
-        const int nlev = r_tile_ + 1;
+        const int nlev = r_tile_block_ + 1;
         const int nxy  = ( lat_tile_ + 1 ) * ( lat_tile_ + 1 );
 
         double* shmem =
@@ -1333,12 +1335,22 @@ class EpsilonDivDivKerngen
 
         team.team_barrier();
 
-        if ( x_cell >= hex_lat_ || y_cell >= hex_lat_ || r_cell >= hex_rad_ )
+        if ( x_cell >= hex_lat_ || y_cell >= hex_lat_ )
             return;
 
-        const int    lvl0 = tr;
+        for ( int pass = 0; pass < r_passes_; ++pass )
+        {
+        const int    lvl0   = pass * r_tile_ + tr;
+        const int    r_cell = r0 + lvl0;
+
+        if ( r_cell >= hex_rad_ )
+            break;
+
         const double r_0  = r_sh( lvl0 );
         const double r_1  = r_sh( lvl0 + 1 );
+
+        const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
+        const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
 
         const BoundaryConditionFlag cmb_bc     = get_boundary_condition_flag( bcs_, CMB );
         const BoundaryConditionFlag surface_bc = get_boundary_condition_flag( bcs_, SURFACE );
@@ -1745,6 +1757,8 @@ class EpsilonDivDivKerngen
             Kokkos::atomic_add(
                 &dst_( local_subdomain_id, x_cell + 1, y_cell + 1, r_cell + 1, dim_add ), dst8[dim_add][7] );
         }
+
+        } // end r_passes loop
     }
 
   public:
@@ -1766,22 +1780,27 @@ class EpsilonDivDivKerngen
         if ( tr >= r_tile_ )
             return;
 
-        const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
-        const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
-
         if ( kernel_path_ == KernelPath::Slow )
         {
-            operator_slow_path(
-                team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
+            for ( int pass = 0; pass < r_passes_; ++pass )
+            {
+                const int r_cell_pass = r0 + pass * r_tile_ + tr;
+                if ( r_cell_pass >= hex_rad_ )
+                    break;
+                const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell_pass, CMB );
+                const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell_pass + 1, SURFACE );
+                operator_slow_path(
+                    team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell_pass, at_cmb, at_surface );
+            }
         }
         else if ( kernel_path_ == KernelPath::FastFreeslip )
         {
             if ( diagonal_ )
                 operator_fast_freeslip_path< true >(
-                    team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
+                    team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell );
             else
                 operator_fast_freeslip_path< false >(
-                    team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
+                    team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell );
         }
         else
         {
