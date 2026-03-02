@@ -90,6 +90,11 @@ for (kid, kname), metrics in kernels.items():
         bw_dram = dram_bytes / (dur * 1e-9) if dur > 0 else 0
         bw_l2 = l2_bytes / (dur * 1e-9) if dur > 0 else 0
 
+        # NCU-reported Speed of Light percentages
+        sol_dram = metrics.get("dram__throughput.avg.pct_of_peak_sustained_elapsed", 0)
+        sol_l2 = metrics.get("lts__throughput.avg.pct_of_peak_sustained_elapsed", 0)
+        sol_sm = metrics.get("sm__throughput.avg.pct_of_peak_sustained_elapsed", 0)
+
         version_data[label] = {
             "duration_ns": dur,
             "flops": flops,
@@ -102,6 +107,9 @@ for (kid, kname), metrics in kernels.items():
             "bw_l2": bw_l2,
             "regs": int(regs),
             "shmem": int(shmem),
+            "sol_dram_pct": sol_dram,
+            "sol_l2_pct": sol_l2,
+            "sol_sm_pct": sol_sm,
         }
 
 sorted_versions = sorted(version_data.items(), key=lambda x: x[0])
@@ -233,20 +241,20 @@ ax_tp.grid(True, axis="y", alpha=0.3)
 ax_tp.tick_params(labelsize=12)
 ax_tp.set_xlim(-0.6, n - 0.4)
 
-# --- % of peak bar chart ---
+# --- % of peak bar chart (NCU Speed of Light metrics) ---
 bar_labels_short = [l.split()[0] for l in bar_labels]
-pct_dram = [version_data[l]["bw_dram"] / PEAK_HBM * 100 for l in bar_labels]
-pct_l2 = [version_data[l]["bw_l2"] / PEAK_L2 * 100 for l in bar_labels]
-pct_fp64 = [version_data[l]["perf_flops"] / PEAK_FP64 * 100 for l in bar_labels]
+pct_dram = [version_data[l]["sol_dram_pct"] for l in bar_labels]
+pct_l2 = [version_data[l]["sol_l2_pct"] for l in bar_labels]
+pct_sm = [version_data[l]["sol_sm_pct"] for l in bar_labels]
 
 x = np.arange(n)
 bw = 0.25
-bars_dram = ax_pct.bar(x - bw, pct_dram, bw, label=f"DRAM BW ({PEAK_HBM_TB_S} TB/s)", color="#4477AA", edgecolor="black", linewidth=0.6, zorder=3)
-bars_l2 = ax_pct.bar(x, pct_l2, bw, label=f"L2 BW ({PEAK_L2_TB_S} TB/s)", color="#66CCEE", edgecolor="black", linewidth=0.6, zorder=3)
-bars_fp64 = ax_pct.bar(x + bw, pct_fp64, bw, label=f"FP64 ({PEAK_FP64_TFLOPS} TFLOP/s)", color="#EE6677", edgecolor="black", linewidth=0.6, zorder=3)
+bars_dram = ax_pct.bar(x - bw, pct_dram, bw, label="DRAM BW", color="#4477AA", edgecolor="black", linewidth=0.6, zorder=3)
+bars_l2 = ax_pct.bar(x, pct_l2, bw, label="L2 BW", color="#66CCEE", edgecolor="black", linewidth=0.6, zorder=3)
+bars_sm = ax_pct.bar(x + bw, pct_sm, bw, label="SM Compute", color="#EE6677", edgecolor="black", linewidth=0.6, zorder=3)
 
 # value labels
-for bars_group in [bars_dram, bars_l2, bars_fp64]:
+for bars_group in [bars_dram, bars_l2, bars_sm]:
     for bar in bars_group:
         h = bar.get_height()
         if h >= 1:
@@ -255,16 +263,19 @@ for bars_group in [bars_dram, bars_l2, bars_fp64]:
 
 ax_pct.set_xticks(x)
 ax_pct.set_xticklabels(bar_labels_short, rotation=45, ha="right", fontsize=11)
-ax_pct.set_ylabel("% of Peak", fontsize=14)
+ax_pct.set_ylabel("% of Peak (NCU Speed of Light)", fontsize=14)
 ax_pct.set_title("Hardware Utilization (NVIDIA H100)", fontsize=15, fontweight="bold")
 ax_pct.legend(fontsize=10, loc="upper left")
 ax_pct.grid(True, axis="y", alpha=0.3)
 ax_pct.tick_params(labelsize=12)
 ax_pct.set_xlim(-0.6, n - 0.4)
-ax_pct.set_ylim(0, max(max(pct_dram), max(pct_l2), max(pct_fp64)) * 1.2)
+ax_pct.set_ylim(0, max(max(pct_dram), max(pct_l2), max(pct_sm)) * 1.15)
 
 fig.suptitle("EpsilonDivDiv Optimization History", fontsize=18, fontweight="bold", y=0.99)
 plt.tight_layout(rect=[0, 0, 1, 0.97])
-plt.savefig("roofline_history.png", dpi=200)
-plt.savefig("roofline_history.pdf")
-print(f"\nSaved roofline_history.png and roofline_history.pdf")
+import os
+out_dir = os.path.expanduser("~/terraneo/doc/epsdivdiv_benchmarks")
+os.makedirs(out_dir, exist_ok=True)
+plt.savefig(os.path.join(out_dir, "roofline_history.png"), dpi=200)
+plt.savefig(os.path.join(out_dir, "roofline_history.pdf"))
+print(f"\nSaved to {out_dir}/roofline_history.{{png,pdf}}")

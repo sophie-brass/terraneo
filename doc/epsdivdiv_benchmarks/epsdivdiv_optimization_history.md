@@ -100,15 +100,6 @@ The operator is optimized for **NVIDIA H100 SXM GPUs** ([Hopper architecture](ht
 | `LaunchBounds<BlockSize, MinBlocks>` | Hints to the compiler: max threads per block and min blocks per SM. Controls register allocation and occupancy. |
 | `Kokkos::atomic_add` | Thread-safe accumulation into global memory — necessary because neighboring elements share nodes. |
 
-### The Performance Bottleneck
-
-This operator is **compute-bound**: each thread evaluates 2 wedge elements involving Jacobian inversion, 6 gradient transforms (per wedge × per node), stress tensor accumulation, and 6 scatter operations — all in double precision. The main optimization levers are:
-
-1. **Register pressure** — fewer registers per thread → more concurrent threads → better latency hiding.
-2. **Shared memory** — loading coordinates, source vector, and coefficients cooperatively avoids redundant global memory traffic.
-3. **Memory coalescing** — reordering thread indices so consecutive threads access contiguous memory addresses.
-4. **Branch elimination** — removing runtime conditionals in the hot kernel via host-side dispatch and template specialization.
-
 ---
 
 ## 3. Glossary
