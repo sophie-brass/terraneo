@@ -1,7 +1,7 @@
 # EpsDivDiv Operator — Optimization History & Technical Documentation
 
 Production file: `src/terra/fe/wedge/operators/shell/epsilon_divdiv_kerngen.hpp`
-Predecessor files: `epsilon_divdiv_simple.hpp` (V-2), `epsilon_divdiv.hpp` (V-1)
+Predecessor files: `epsilon_divdiv_simple.hpp` (v00a), `epsilon_divdiv.hpp` (v00b)
 GitHub base: `https://github.com/mantleconvection/terraneo`
 Links use `blob/<commit>/...#L<line>` to pin each optimization to the exact commit where it was introduced.
 
@@ -67,7 +67,7 @@ Integration over each element uses numerical quadrature:
 ∫_Ω_e f dx ≈ Σ_q w_q · f(x_q) · |det(J(x_q))|
 ```
 
-- **V-2 through V01**: 6-point Felippa 3×2 rule (3 triangle × 2 line points) — exact for the bilinear form.
+- **v00a through V01**: 6-point Felippa 3×2 rule (3 triangle × 2 line points) — exact for the bilinear form.
 - **V03 onwards**: Collapsed to **1-point** Felippa 1×1 rule at the centroid (ξ=⅓, η=⅓, ζ=0, weight=1). This is a reduced-integration approximation that trades exactness for 6× fewer evaluations per element. The resulting operator is spectrally close enough for iterative solver convergence.
 
 ---
@@ -90,7 +90,7 @@ The operator is optimized for **NVIDIA H100 SXM GPUs** ([Hopper architecture](ht
 
 | Concept | Role in this operator |
 |---------|----------------------|
-| `MDRangePolicy` | Maps each (subdomain, x, y, r) cell to one thread — used in V-2 through V01. Simple but no data sharing between threads. |
+| `MDRangePolicy` | Maps each (subdomain, x, y, r) cell to one thread — used in v00a through V01. Simple but no data sharing between threads. |
 | `TeamPolicy` | Groups threads into **teams** (= CUDA thread blocks). Each team processes a tile of cells and shares data via scratch memory. Used from V03 onwards. |
 | `team.team_rank()` | Thread's index within its team (0..team_size-1). |
 | `TeamThreadRange` | Distributes a loop across team members — used for cooperative shared memory loads. |
@@ -160,7 +160,7 @@ File: `src/terra/fe/wedge/operators/shell/epsilon_divdiv_simple.hpp`
 
 ---
 
-### V-1: EpsilonDivDiv — refactored (bdb954c — "Use refactored eps + divdiv in Stokes test")
+### v00b: EpsilonDivDiv — refactored (bdb954c — "Use refactored eps + divdiv in Stokes test")
 
 File: `src/terra/fe/wedge/operators/shell/epsilon_divdiv.hpp`
 
@@ -409,8 +409,8 @@ File: `src/terra/fe/wedge/operators/shell/epsilon_divdiv.hpp`
 
 | Version | Date | Commit | File | Key Innovation | Gdof/s | Speedup |
 |---------|------|--------|------|----------------|--------|---------|
-| V-2 | 2025-11-09 | [aba88f1](https://github.com/mantleconvection/terraneo/commit/aba88f1) | [`epsilon_divdiv_simple.hpp`](../../src/terra/fe/wedge/operators/shell/epsilon_divdiv_simple.hpp) | Textbook: assemble 18×18 A, then A·src; Hadamard BC mask | 0.012 | 1× |
-| V-1 | 2025-11-17 | [bdb954c](https://github.com/mantleconvection/terraneo/commit/bdb954c) | [`epsilon_divdiv.hpp`](../../src/terra/fe/wedge/operators/shell/epsilon_divdiv.hpp) | Fused local matvec (no full A), trial/test vecs, GCA support | 0.019 | 1.6× |
+| v00a | 2025-11-09 | [aba88f1](https://github.com/mantleconvection/terraneo/commit/aba88f1) | [`epsilon_divdiv_simple.hpp`](../../src/terra/fe/wedge/operators/shell/epsilon_divdiv_simple.hpp) | Textbook: assemble 18×18 A, then A·src; Hadamard BC mask | 0.012 | 1× |
+| v00b | 2025-11-17 | [bdb954c](https://github.com/mantleconvection/terraneo/commit/bdb954c) | [`epsilon_divdiv.hpp`](../../src/terra/fe/wedge/operators/shell/epsilon_divdiv.hpp) | Fused local matvec (no full A), trial/test vecs, GCA support | 0.019 | 1.6× |
 | V01 | 2025-12-09 | [e7ae1b3](https://github.com/mantleconvection/terraneo/commit/e7ae1b3) | [`epsilon_divdiv_kerngen_v01_initial.hpp`](../../src/terra/fe/wedge/operators/shell/epsilon_divdiv_kerngen_v01_initial.hpp) | Code-gen: MDRange, 6-qp, O(3×3) dimi/dimj, scalar arith | 0.044 | 3.8× |
 | V02 | 2025-12-09 | [c9c1e21](https://github.com/mantleconvection/terraneo/commit/c9c1e21) | [`epsilon_divdiv_kerngen_v02_split_dimij.hpp`](../../src/terra/fe/wedge/operators/shell/epsilon_divdiv_kerngen_v02_split_dimij.hpp) | Split dimi/dimj → O(3+3), fewer FLOPs | 0.107 | 9.2× |
 | V03 | 2025-12-18 | [b875f4c](https://github.com/mantleconvection/terraneo/commit/b875f4c) | [`epsilon_divdiv_kerngen_v03_teams_precomp.hpp`](../../src/terra/fe/wedge/operators/shell/epsilon_divdiv_kerngen_v03_teams_precomp.hpp) | TeamPolicy, 1-qp collapse, shmem coords | 1.71 | 146× |
@@ -430,7 +430,7 @@ Benchmarked on NVIDIA H100 SXM, level 8 (505M dofs), 10 executions, single GPU. 
 Looking across the full history, the optimizations fall into recurring themes:
 
 1. **Reduce register pressure** — the dominant constraint on GPU occupancy.
-   - V-1: Fused matvec eliminates 18×18 matrix (648 → ~36 regs)
+   - v00b: Fused matvec eliminates 18×18 matrix (648 → ~36 regs)
    - V02: Split dimi/dimj reduces live intermediates
    - V08: Per-wedge scatter (`dst_w[3][6]`) vs. per-hex (`dst8[3][8]`)
    - V09: Scoped gather/scatter phases, recompute J to free registers
