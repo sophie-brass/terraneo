@@ -598,12 +598,13 @@ test( int    min_level,
 
     linalg::apply( M, stok_vecs["tmp_1"].block_1(), stok_vecs["f"].block_1() );
 
-    // Homogeneous boundary enforcement: zero all velocity RHS at all boundary nodes.
-    // The FREESLIP flag in the operator handles the free-slip condition at CMB.
-    // The DIRICHLET flag handles the zero-slip condition at SURFACE.
-    // (Same approach as mantlecirculation app.)
+    // Free-slip at CMB: zero only the normal component of the RHS
+    fe::strong_algebraic_freeslip_enforcement_in_place(
+        stok_vecs["f"], coords_shell[velocity_level], boundary_mask_data[velocity_level], CMB );
+
+    // Zero-slip at surface: zero all velocity RHS components
     fe::strong_algebraic_homogeneous_velocity_dirichlet_enforcement_stokes_like(
-        stok_vecs["f"], boundary_mask_data[velocity_level], BOUNDARY );
+        stok_vecs["f"], boundary_mask_data[velocity_level], SURFACE );
 
     using Smoother = linalg::solvers::Chebyshev< Viscous >;
 
@@ -771,6 +772,39 @@ test( int    min_level,
           { "inf_res_pre", inf_residual_pre },
           { "h_vel", ( r_max - r_min ) / std::pow( 2, max_level ) },
           { "h_p", ( r_max - r_min ) / std::pow( 2, max_level - 1 ) } } );
+
+    // Write XDMF output for visualization
+    {
+        util::logroot << "Writing XDMF output (velocity level) ...\n";
+
+        io::XDMFOutput xdmf_vel(
+            "xdmf_velocity_level_" + std::to_string( max_level ),
+            domains[velocity_level],
+            coords_shell[velocity_level],
+            coords_radii[velocity_level] );
+
+        xdmf_vel.add( u.block_1().grid_data() );
+        xdmf_vel.add( solution.block_1().grid_data() );
+        xdmf_vel.add( error.block_1().grid_data() );
+
+        xdmf_vel.write();
+
+        util::logroot << "Writing XDMF output (pressure level) ...\n";
+
+        io::XDMFOutput xdmf_pre(
+            "xdmf_pressure_level_" + std::to_string( max_level ),
+            domains[pressure_level],
+            coords_shell[pressure_level],
+            coords_radii[pressure_level] );
+
+        xdmf_pre.add( u.block_2().grid_data() );
+        xdmf_pre.add( solution.block_2().grid_data() );
+        xdmf_pre.add( error.block_2().grid_data() );
+
+        xdmf_pre.write();
+
+        util::logroot << "XDMF output written.\n";
+    }
 
     return {
         l2_error_velocity,
