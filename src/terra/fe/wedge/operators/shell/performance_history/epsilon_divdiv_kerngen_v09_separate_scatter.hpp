@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../quadrature/quadrature.hpp"
+#include "../../../quadrature/quadrature.hpp"
 #include "communication/shell/communication.hpp"
 #include "communication/shell/communication_plan.hpp"
 #include "dense/vec.hpp"
@@ -10,14 +10,12 @@
 #include "impl/Kokkos_Profiling.hpp"
 #include "linalg/operator.hpp"
 #include "linalg/solvers/gca/local_matrix_storage.hpp"
-#include "grid/bit_masks.hpp"
-#include "kernels/common/grid_operations.hpp"
 #include "linalg/trafo/local_basis_trafo_normal_tangential.hpp"
 #include "linalg/vector.hpp"
 #include "linalg/vector_q1.hpp"
 #include "util/timer.hpp"
 
-namespace terra::fe::wedge::operators::shell {
+namespace terra::fe::wedge::operators::shell::epsdivdiv_history {
 
 using grid::shell::get_boundary_condition_flag;
 using grid::shell::BoundaryConditionFlag::DIRICHLET;
@@ -56,7 +54,7 @@ using terra::linalg::trafo::trafo_mat_cartesian_to_normal_tangential;
  * This avoids a runtime branch inside the hot device kernel.
  */
 template < typename ScalarT, int VecDim = 3 >
-class EpsilonDivDivKerngen
+class EpsilonDivDivKerngenV09SeparateScatter
 {
   public:
     using SrcVectorType                 = linalg::VectorQ1Vec< ScalarT, VecDim >;
@@ -130,12 +128,6 @@ class EpsilonDivDivKerngen
     };
     KernelPath kernel_path_ = KernelPath::FastDirichletNeumann;
 
-    // Rotation null-space penalty (active only for fs/fs)
-    bool                                              penalty_active_  = false;
-    ScalarT                                           penalty_epsilon_ = 1.0;
-    grid::Grid4DDataVec< ScalarType, VecDim >         null_modes_[3];
-    grid::Grid4DDataScalar< grid::NodeOwnershipFlag > ownership_mask_;
-
   private:
     /**
      * @brief Recompute the kernel path on host.
@@ -161,9 +153,8 @@ class EpsilonDivDivKerngen
             kernel_path_ = KernelPath::FastDirichletNeumann;
     }
 
-
   public:
-    EpsilonDivDivKerngen(
+    EpsilonDivDivKerngenV09SeparateScatter(
         const grid::shell::DistributedDomain&                           domain,
         const grid::Grid3DDataVec< ScalarT, 3 >&                        grid,
         const grid::Grid2DDataScalar< ScalarT >&                        radii,
@@ -201,7 +192,7 @@ class EpsilonDivDivKerngen
 
         lat_tile_     = 4;
         r_tile_       = 8;
-        r_passes_     = 2;
+        r_passes_     = 1;
         r_tile_block_ = r_tile_ * r_passes_;
 
         lat_tiles_ = ( hex_lat_ + lat_tile_ - 1 ) / lat_tile_;
@@ -224,145 +215,6 @@ class EpsilonDivDivKerngen
                                 ( kernel_path_ == KernelPath::FastFreeslip ) ? "fast-freeslip" :
                                                                                "fast-dirichlet-neumann";
         util::logroot << "[EpsilonDivDiv] kernel path = " << path_name << std::endl;
-
-        init_penalty();
-    }
-
-    void set_penalty_epsilon( ScalarT eps ) { penalty_epsilon_ = eps; }
-
-    /**
-     * @brief Initialize penalty for fs/fs null-space regularization.
-     *
-     * Builds 3 orthonormal rotation-mode vectors (ê_i × r) with free-slip
-     * enforcement, then Gram-Schmidt orthonormalizes them.
-     * Only called when both CMB and SURFACE have FREESLIP BCs.
-     */
-    void init_penalty()
-    {
-        const BoundaryConditionFlag cmb_bc     = get_boundary_condition_flag( bcs_, CMB );
-        const BoundaryConditionFlag surface_bc = get_boundary_condition_flag( bcs_, SURFACE );
-
-        penalty_active_ = ( cmb_bc == FREESLIP ) && ( surface_bc == FREESLIP );
-        if ( !penalty_active_ )
-            return;
-
-        util::logroot << "[EpsilonDivDiv] Initializing fs/fs null-space penalty (epsilon="
-                      << penalty_epsilon_ << ")" << std::endl;
-
-        ownership_mask_ = grid::setup_node_ownership_mask_data( domain_ );
-
-        const int nsub = domain_.subdomains().size();
-        const int nlat = domain_.domain_info().subdomain_num_nodes_per_side_laterally();
-        const int nrad = domain_.domain_info().subdomain_num_nodes_radially();
-
-        auto grid_local  = grid_;
-        auto radii_local = radii_;
-        auto mask_local  = mask_;
-
-        // Build 3 rotation modes: axis i => ê_i × r
-        for ( int axis = 0; axis < 3; ++axis )
-        {
-            null_modes_[axis] = grid::Grid4DDataVec< ScalarType, VecDim >(
-                "penalty_null_mode_" + std::to_string( axis ), nsub, nlat, nlat, nrad );
-
-            auto nm = null_modes_[axis];
-
-            Kokkos::parallel_for(
-                "penalty_fill_mode_" + std::to_string( axis ),
-                Kokkos::MDRangePolicy< Kokkos::Rank< 4 > >(
-                    { 0, 0, 0, 0 }, { nsub, nlat, nlat, nrad } ),
-                KOKKOS_LAMBDA( int s, int x, int y, int r ) {
-                    const auto c = grid::shell::coords( s, x, y, r, grid_local, radii_local );
-                    // ê_axis × r: cyclic cross product
-                    // axis=0: (0, z, -y), axis=1: (-z, 0, x), axis=2: (y, -x, 0)
-                    const int a1 = ( axis + 1 ) % 3;
-                    const int a2 = ( axis + 2 ) % 3;
-                    for ( int d = 0; d < VecDim; ++d )
-                        nm( s, x, y, r, d ) = 0.0;
-                    nm( s, x, y, r, a1 ) =  c( a2 );
-                    nm( s, x, y, r, a2 ) = -c( a1 );
-                } );
-            Kokkos::fence();
-
-            // Free-slip enforce: transform to n-t, zero normal, transform back
-            // Do this for both CMB and SURFACE boundaries
-            auto freeslip_boundary_mask =
-                static_cast< grid::shell::ShellBoundaryFlag >(
-                    static_cast< uint8_t >( CMB ) | static_cast< uint8_t >( SURFACE ) );
-
-            Kokkos::parallel_for(
-                "penalty_fs_enforce_" + std::to_string( axis ),
-                Kokkos::MDRangePolicy< Kokkos::Rank< 4 > >(
-                    { 0, 0, 0, 0 }, { nsub, nlat, nlat, nrad } ),
-                KOKKOS_LAMBDA( int s, int x, int y, int r ) {
-                    if ( !util::has_flag( mask_local( s, x, y, r ), freeslip_boundary_mask ) )
-                        return;
-
-                    dense::Vec< ScalarType, 3 > v;
-                    for ( int d = 0; d < 3; ++d )
-                        v( d ) = nm( s, x, y, r, d );
-
-                    dense::Vec< ScalarType, 3 > normal;
-                    for ( int d = 0; d < 3; ++d )
-                        normal( d ) = grid_local( s, x, y, d );
-
-                    // R * v -> normal-tangential
-                    const auto R  = trafo_mat_cartesian_to_normal_tangential( normal );
-                    auto       nt = R * v;
-
-                    // Zero normal component
-                    nt( 0 ) = 0.0;
-
-                    // R^T * nt -> back to Cartesian
-                    const auto Rt   = R.transposed();
-                    const auto cart = Rt * nt;
-
-                    for ( int d = 0; d < 3; ++d )
-                        nm( s, x, y, r, d ) = cart( d );
-                } );
-            Kokkos::fence();
-        }
-
-        // Gram-Schmidt orthonormalization
-        for ( int i = 0; i < 3; ++i )
-        {
-            // Subtract projections of previous modes
-            for ( int j = 0; j < i; ++j )
-            {
-                ScalarType dot_ij = kernels::common::masked_dot_product(
-                    null_modes_[i], null_modes_[j], ownership_mask_, grid::NodeOwnershipFlag::OWNED );
-
-                auto ni = null_modes_[i];
-                auto nj = null_modes_[j];
-                Kokkos::parallel_for(
-                    "penalty_gs_subtract",
-                    Kokkos::MDRangePolicy< Kokkos::Rank< 4 > >(
-                        { 0, 0, 0, 0 }, { nsub, nlat, nlat, nrad } ),
-                    KOKKOS_LAMBDA( int s, int x, int y, int r ) {
-                        for ( int d = 0; d < VecDim; ++d )
-                            ni( s, x, y, r, d ) -= dot_ij * nj( s, x, y, r, d );
-                    } );
-                Kokkos::fence();
-            }
-
-            // Normalize
-            ScalarType norm_sq = kernels::common::masked_dot_product(
-                null_modes_[i], null_modes_[i], ownership_mask_, grid::NodeOwnershipFlag::OWNED );
-            ScalarType inv_norm = 1.0 / Kokkos::sqrt( norm_sq );
-
-            auto ni = null_modes_[i];
-            Kokkos::parallel_for(
-                "penalty_gs_normalize",
-                Kokkos::MDRangePolicy< Kokkos::Rank< 4 > >(
-                    { 0, 0, 0, 0 }, { nsub, nlat, nlat, nrad } ),
-                KOKKOS_LAMBDA( int s, int x, int y, int r ) {
-                    for ( int d = 0; d < VecDim; ++d )
-                        ni( s, x, y, r, d ) *= inv_norm;
-                } );
-            Kokkos::fence();
-        }
-
-        util::logroot << "[EpsilonDivDiv] Null-space penalty initialized (3 modes)" << std::endl;
     }
 
     void set_operator_apply_and_communication_modes(
@@ -547,31 +399,6 @@ class EpsilonDivDivKerngen
         Kokkos::fence();
         timer_kernel.stop();
 
-        // Null-space penalty for fs/fs: dst += epsilon * sum_i (n_i^T src) n_i
-        if ( penalty_active_ && !diagonal_ )
-        {
-            for ( int i = 0; i < 3; ++i )
-            {
-                ScalarType alpha = penalty_epsilon_ *
-                    kernels::common::masked_dot_product(
-                        null_modes_[i], src_, ownership_mask_, grid::NodeOwnershipFlag::OWNED );
-
-                auto nm        = null_modes_[i];
-                auto dst_local = dst_;
-                Kokkos::parallel_for(
-                    "penalty_axpy",
-                    Kokkos::MDRangePolicy< Kokkos::Rank< 4 > >(
-                        { 0, 0, 0, 0 },
-                        { dst_local.extent( 0 ), dst_local.extent( 1 ),
-                          dst_local.extent( 2 ), dst_local.extent( 3 ) } ),
-                    KOKKOS_LAMBDA( int s, int x, int y, int r ) {
-                        for ( int d = 0; d < VecDim; ++d )
-                            dst_local( s, x, y, r, d ) += alpha * nm( s, x, y, r, d );
-                    } );
-            }
-            Kokkos::fence( "penalty" );
-        }
-
         if ( operator_communication_mode_ == linalg::OperatorCommunicationMode::CommunicateAdditively )
         {
             util::Timer timer_comm( "epsilon_divdiv_comm" );
@@ -637,7 +464,7 @@ class EpsilonDivDivKerngen
     KOKKOS_INLINE_FUNCTION
     size_t team_shmem_size( const int ts ) const
     {
-        const int nlev = r_tile_block_ + 1;
+        const int nlev = r_tile_ + 1;
         const int n    = lat_tile_ + 1;
         const int nxy  = n * n;
 
@@ -734,18 +561,11 @@ class EpsilonDivDivKerngen
         if ( tr >= r_tile_ )
             return;
 
-        for ( int pass = 0; pass < r_passes_; ++pass )
-        {
-            const int r_cell_pass = r0 + pass * r_tile_ + tr;
-            if ( r_cell_pass >= hex_rad_ )
-                break;
+        const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
+        const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
 
-            const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell_pass, CMB );
-            const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell_pass + 1, SURFACE );
-
-            operator_slow_path(
-                team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell_pass, at_cmb, at_surface );
-        }
+        operator_slow_path(
+            team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
     }
 
     /**
@@ -784,8 +604,11 @@ class EpsilonDivDivKerngen
         if ( tr >= r_tile_ )
             return;
 
+        const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
+        const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
+
         operator_fast_freeslip_path< Diagonal >(
-            team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell );
+            team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
     }
 
     // ===================== SLOW PATH =====================
@@ -1137,13 +960,12 @@ class EpsilonDivDivKerngen
         const int n10 = node_id( tx + 1, ty );
         const int n11 = node_id( tx + 1, ty + 1 );
 
-        for ( int pass = 0; pass < r_passes_; ++pass )
         {
-            const int lvl0   = pass * r_tile_ + tr;
-            const int r_cell = r0 + lvl0;
+            const int lvl0   = tr;
+            const int r_cell = r0 + tr;
 
             if ( r_cell >= hex_rad_ )
-                break;
+                return;
 
             const double r_0 = r_sh( lvl0 );
             const double r_1 = r_sh( lvl0 + 1 );
@@ -1405,9 +1227,12 @@ class EpsilonDivDivKerngen
         const int   ty,
         const int   tr,
         const int   x_cell,
-        const int   y_cell ) const
+        const int   y_cell,
+        const int   r_cell,
+        const bool  at_cmb,
+        const bool  at_surface ) const
     {
-        const int nlev = r_tile_block_ + 1;
+        const int nlev = r_tile_ + 1;
         const int nxy  = ( lat_tile_ + 1 ) * ( lat_tile_ + 1 );
 
         double* shmem =
@@ -1508,22 +1333,12 @@ class EpsilonDivDivKerngen
 
         team.team_barrier();
 
-        if ( x_cell >= hex_lat_ || y_cell >= hex_lat_ )
+        if ( x_cell >= hex_lat_ || y_cell >= hex_lat_ || r_cell >= hex_rad_ )
             return;
 
-        for ( int pass = 0; pass < r_passes_; ++pass )
-        {
-        const int    lvl0   = pass * r_tile_ + tr;
-        const int    r_cell = r0 + lvl0;
-
-        if ( r_cell >= hex_rad_ )
-            break;
-
+        const int    lvl0 = tr;
         const double r_0  = r_sh( lvl0 );
         const double r_1  = r_sh( lvl0 + 1 );
-
-        const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
-        const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
 
         const BoundaryConditionFlag cmb_bc     = get_boundary_condition_flag( bcs_, CMB );
         const BoundaryConditionFlag surface_bc = get_boundary_condition_flag( bcs_, SURFACE );
@@ -1930,8 +1745,6 @@ class EpsilonDivDivKerngen
             Kokkos::atomic_add(
                 &dst_( local_subdomain_id, x_cell + 1, y_cell + 1, r_cell + 1, dim_add ), dst8[dim_add][7] );
         }
-
-        } // end r_passes loop
     }
 
   public:
@@ -1953,27 +1766,22 @@ class EpsilonDivDivKerngen
         if ( tr >= r_tile_ )
             return;
 
+        const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell, CMB );
+        const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell + 1, SURFACE );
+
         if ( kernel_path_ == KernelPath::Slow )
         {
-            for ( int pass = 0; pass < r_passes_; ++pass )
-            {
-                const int r_cell_pass = r0 + pass * r_tile_ + tr;
-                if ( r_cell_pass >= hex_rad_ )
-                    break;
-                const bool at_cmb     = has_flag( local_subdomain_id, x_cell, y_cell, r_cell_pass, CMB );
-                const bool at_surface = has_flag( local_subdomain_id, x_cell, y_cell, r_cell_pass + 1, SURFACE );
-                operator_slow_path(
-                    team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell_pass, at_cmb, at_surface );
-            }
+            operator_slow_path(
+                team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
         }
         else if ( kernel_path_ == KernelPath::FastFreeslip )
         {
             if ( diagonal_ )
                 operator_fast_freeslip_path< true >(
-                    team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell );
+                    team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
             else
                 operator_fast_freeslip_path< false >(
-                    team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell );
+                    team, local_subdomain_id, x0, y0, r0, tx, ty, tr, x_cell, y_cell, r_cell, at_cmb, at_surface );
         }
         else
         {
@@ -2084,7 +1892,7 @@ class EpsilonDivDivKerngen
     }
 };
 
-static_assert( linalg::GCACapable< EpsilonDivDivKerngen< float > > );
-static_assert( linalg::GCACapable< EpsilonDivDivKerngen< double > > );
+static_assert( linalg::GCACapable< EpsilonDivDivKerngenV09SeparateScatter< float > > );
+static_assert( linalg::GCACapable< EpsilonDivDivKerngenV09SeparateScatter< double > > );
 
-} // namespace terra::fe::wedge::operators::shell
+} // namespace terra::fe::wedge::operators::shell::epsdivdiv_history
