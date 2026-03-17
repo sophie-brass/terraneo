@@ -39,7 +39,6 @@ class MPIContext
     /// Initialize MPI once. Safe to call only once.
     static void initialize( int* argc, char*** argv ) { 
         instance( argc, argv ); 
-	nesmik::init();
     }
 
     /// Query whether MPI is initialized
@@ -70,6 +69,7 @@ class MPIContext
         }
 
         int err = MPI_Init( argc, argv );
+	nesmik::init();
         if ( err != MPI_SUCCESS )
         {
             char errstr[MPI_MAX_ERROR_STRING];
@@ -89,7 +89,6 @@ class MPIContext
         if ( mpi_initialized_ && !is_finalized() )
         {
 	    nesmik::finalize();
-	    MPI_Barrier(MPI_COMM_WORLD);
             int err = MPI_Finalize();
             if ( err != MPI_SUCCESS )
             {
