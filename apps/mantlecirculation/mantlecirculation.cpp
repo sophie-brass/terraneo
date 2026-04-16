@@ -2,6 +2,7 @@
 #include <vector>
 
 #include "communication/shell/communication.hpp"
+#include "communication/shell/fv_communication.hpp"
 #include "fe/strong_algebraic_dirichlet_enforcement.hpp"
 #include "fe/strong_algebraic_freeslip_enforcement.hpp"
 #include "fe/wedge/integrands.hpp"
@@ -13,6 +14,9 @@
 #include "fe/wedge/operators/shell/stokes.hpp"
 #include "fe/wedge/operators/shell/unsteady_advection_diffusion_supg.hpp"
 #include "fe/wedge/operators/shell/vector_mass.hpp"
+#include "fv/hex/conversion.hpp"
+#include "fv/hex/helpers.hpp"
+#include "fv/hex/operators/fct_advection_diffusion.hpp"
 #include "geophysics/viscosity/viscosity_interpolation.hpp"
 #include "grid/grid_types.hpp"
 #include "grid/shell/spherical_shell.hpp"
@@ -29,6 +33,7 @@
 #include "linalg/solvers/multigrid.hpp"
 #include "linalg/solvers/pcg.hpp"
 #include "linalg/solvers/power_iteration.hpp"
+#include "linalg/vector_fv.hpp"
 #include "linalg/vector_q1isoq2_q1.hpp"
 #include "src/io.hpp"
 #include "src/parameters.hpp"
@@ -187,6 +192,44 @@ struct NoiseAdder
         }
 
         rand_pool_.free_state( generator );
+    }
+};
+
+/// Initial condition for FV cell-centred temperature: same radial profile as the Q1 version,
+/// evaluated at the precomputed cell centres.
+struct FVInitialConditionInterpolator
+{
+    ScalarType                     r_min_, r_max_;
+    Grid4DDataVec< ScalarType, 3 > cell_centers_;
+    Grid4DDataScalar< ScalarType > data_;
+
+    KOKKOS_INLINE_FUNCTION
+    void operator()( const int id, const int x, const int y, const int r ) const
+    {
+        const ScalarType cx     = cell_centers_( id, x, y, r, 0 );
+        const ScalarType cy     = cell_centers_( id, x, y, r, 1 );
+        const ScalarType cz     = cell_centers_( id, x, y, r, 2 );
+        const ScalarType radius = Kokkos::sqrt( cx * cx + cy * cy + cz * cz );
+        const ScalarType frac   = ( r_max_ - radius ) / ( r_max_ - r_min_ );
+        data_( id, x, y, r )    = Kokkos::pow( frac, ScalarType( 5 ) );
+    }
+};
+
+/// Noise adder for FV cells.  All non-ghost cells are owned by the local subdomain,
+/// so no ownership mask is needed.
+struct FVNoiseAdder
+{
+    Grid4DDataScalar< ScalarType >   data_T_;
+    Kokkos::Random_XorShift64_Pool<> rand_pool_;
+
+    KOKKOS_INLINE_FUNCTION
+    void operator()( const int id, const int x, const int y, const int r ) const
+    {
+        auto             gen          = rand_pool_.get_state();
+        const ScalarType eps          = 1e-1;
+        const ScalarType perturbation = eps * ( 2.0 * gen.drand() - 1.0 );
+        data_T_( id, x, y, r )        = Kokkos::clamp( data_T_( id, x, y, r ) + perturbation, 0.0, 1.0 );
+        rand_pool_.free_state( gen );
     }
 };
 
@@ -405,14 +448,33 @@ Result<> run( const Parameters& prm )
     auto& T = temp_vecs["T"];
     auto& q = temp_vecs["q"];
 
+    // Finite-volume functions/vectors.
+
+    // FV cell-centred temperature field (the FCT prognostic variable).
+    linalg::VectorFVScalar< ScalarType > T_fct( "T_fct", domains[velocity_level] );
+    // Pre-computed cell centres (with ghost layers filled once and reused every step).
+    linalg::VectorFVVec< ScalarType, 3 > fv_cell_centers( "fv_cell_centers", domains[velocity_level] );
+    fv::hex::initialize_cell_centers(
+        fv_cell_centers, domains[velocity_level], coords_shell[velocity_level], coords_radii[velocity_level] );
+    // Pre-allocated FCT scratch buffers (reused every step).
+    fv::hex::operators::FVFCTBuffers< ScalarType > fv_fct_bufs( domains[velocity_level] );
+    // Temporaries for the FV→Q1 L2 projection (reused every step; share storage with temp_vecs).
+    // l2_project_fv_to_fe requires at least 5 Q1 temporaries.
+    std::vector< VectorQ1Scalar< ScalarType > > l2_proj_tmps = {
+        temp_vecs["tmp_0"], temp_vecs["tmp_1"], temp_vecs["tmp_2"], temp_vecs["tmp_3"], temp_vecs["tmp_4"] };
+
+    linalg::VectorFVScalar< ScalarType > T_source( "T_source", domains[velocity_level] );
+    linalg::assign( T_source, 0.0 );
+
     // Counting DoFs.
     int world_size = mpi::num_processes();
 
-    const auto num_dofs_temperature =
+    const auto num_dofs_fe_scalar =
         kernels::common::count_masked< long >( ownership_mask_data[num_levels - 1], grid::NodeOwnershipFlag::OWNED );
-    const auto num_dofs_velocity = 3 * num_dofs_temperature;
+    const auto num_dofs_velocity = 3 * num_dofs_fe_scalar;
     const auto num_dofs_pressure =
         kernels::common::count_masked< long >( ownership_mask_data[num_levels - 2], grid::NodeOwnershipFlag::OWNED );
+    const auto num_dofs_temperature = domains[velocity_level].domain_info().num_global_micro_hex_cells();
 
     logroot << "Degrees of freedom in (T,u,p) = (" << num_dofs_temperature << ", " << num_dofs_velocity << ", "
             << num_dofs_pressure << ")" << std::endl;
@@ -671,98 +733,46 @@ Result<> run( const Parameters& prm )
 
     logroot << "Setting up energy equation solver ..." << std::endl;
 
-    using AD = fe::wedge::operators::shell::UnsteadyAdvectionDiffusionSUPG< ScalarType >;
-
-    // The advection-diffusion operator executes a matvec with (alpha * M + dt * A),
-    // where M is the mass matrix and A the adv-diff operator. For higher order BDF schemes we need a mass
-    constexpr auto mass_scaling = 1.0;
-
-    AD A(
-        domains[velocity_level],
-        coords_shell[velocity_level],
-        coords_radii[velocity_level],
-        boundary_mask_data[velocity_level],
-        u.block_1(),
-        prm.physics_parameters.diffusivity,
-        0.0,
-        true,
-        false,
-        mass_scaling );
-
-    AD A_neumann(
-        domains[velocity_level],
-        coords_shell[velocity_level],
-        coords_radii[velocity_level],
-        boundary_mask_data[velocity_level],
-        u.block_1(),
-        prm.physics_parameters.diffusivity,
-        0.0,
-        false,
-        false,
-        mass_scaling );
-
-    AD A_neumann_diag(
-        domains[velocity_level],
-        coords_shell[velocity_level],
-        coords_radii[velocity_level],
-        boundary_mask_data[velocity_level],
-        u.block_1(),
-        prm.physics_parameters.diffusivity,
-        0.0,
-        false,
-        true,
-        mass_scaling );
-
-    using TempMass = fe::wedge::operators::shell::Mass< ScalarType >;
-
-    TempMass M_T( domains[velocity_level], coords_shell[velocity_level], coords_radii[velocity_level], false );
-
     // Set up the initial temperature.
 
+    // --- FCT: initialise T_fct on FV cell centres ---
     Kokkos::parallel_for(
-        "initial temp interpolation",
-        local_domain_md_range_policy_nodes( domains[velocity_level] ),
-        InitialConditionInterpolator(
+        "initial temp interpolation (FCT)",
+        grid::shell::local_domain_md_range_policy_cells_fv_skip_ghost_layers( domains[velocity_level] ),
+        FVInitialConditionInterpolator{
             domains[velocity_level].domain_info().radii().front(),
             domains[velocity_level].domain_info().radii().back(),
-            coords_shell[velocity_level],
-            coords_radii[velocity_level],
-            T.grid_data(),
-            boundary_mask_data[velocity_level],
-            false ) );
+            fv_cell_centers.grid_data(),
+            T_fct.grid_data() } );
 
     Kokkos::fence();
 
     Kokkos::parallel_for(
-        "adding noise to temp",
-        local_domain_md_range_policy_nodes( domains[velocity_level] ),
-        NoiseAdder(
-            coords_shell[velocity_level],
-            coords_radii[velocity_level],
-            T.grid_data(),
-            ownership_mask_data[velocity_level] ) );
+        "adding noise to temp (FCT)",
+        grid::shell::local_domain_md_range_policy_cells_fv_skip_ghost_layers( domains[velocity_level] ),
+        FVNoiseAdder{ T_fct.grid_data(), Kokkos::Random_XorShift64_Pool<>( 12345 ) } );
 
-    communication::shell::send_recv(
-        domains[velocity_level], T.grid_data(), communication::CommunicationReduction::SUM );
+    Kokkos::fence();
 
-    const auto num_energy_fgmres_tmps = 2 * prm.energy_solver_parameters.krylov_restart + 4;
+    // Enforce Dirichlet BCs on the initial FV field.  This must happen before
+    // update_fv_ghost_layers so that the radial ghost cells at the physical
+    // boundaries (CMB r=0, surface r=N) are set to the correct BC values.
+    // update_fv_ghost_layers does not touch those ghost cells (no subdomain
+    // neighbour exists beyond a physical boundary).
 
-    std::vector< VectorQ1Scalar< ScalarType > > energy_tmp_fgmres;
-    energy_tmp_fgmres.reserve( num_energy_fgmres_tmps );
-    for ( int i = 0; i < num_energy_fgmres_tmps; i++ )
-    {
-        energy_tmp_fgmres.emplace_back(
-            "energy_tmp_fgmres", domains[velocity_level], ownership_mask_data[velocity_level] );
-    }
+    const fv::hex::DirichletBCs< ScalarType > fct_bcs{
+        .T_cmb         = static_cast< ScalarType >( prm.boundary_conditions_parameters.temperature_cmb ),
+        .T_surface     = static_cast< ScalarType >( prm.boundary_conditions_parameters.temperature_surface ),
+        .apply_cmb     = true,
+        .apply_surface = true };
 
-    linalg::solvers::FGMRES< AD > energy_solver(
-        energy_tmp_fgmres,
-        { .restart                     = prm.energy_solver_parameters.krylov_restart,
-          .relative_residual_tolerance = prm.energy_solver_parameters.krylov_relative_tolerance,
-          .absolute_residual_tolerance = prm.energy_solver_parameters.krylov_absolute_tolerance,
-          .max_iterations              = prm.energy_solver_parameters.krylov_max_iterations },
-        table );
-    energy_solver.set_tag( "energy_fgmres" );
+    fv::hex::apply_dirichlet_bcs( T_fct, boundary_mask_data[velocity_level], fct_bcs, domains[velocity_level] );
+
+    communication::shell::update_fv_ghost_layers( domains[velocity_level], T_fct.grid_data() );
+
+    // Project T_fct to Q1 T via L2 projection for use as Stokes RHS and output.
+    fv::hex::l2_project_fv_to_fe(
+        T, T_fct, domains[velocity_level], coords_shell[velocity_level], coords_radii[velocity_level], l2_proj_tmps );
 
     table->add_row( {
         { "tag", "setup" },
@@ -828,6 +838,12 @@ Result<> run( const Parameters& prm )
         // Thus, we will now re-write the loaded data.
         // Maybe a good sanity check.
         xdmf_output.set_write_counter( timestep_initial );
+
+        // T_fct is not stored in checkpoints (only Q1 T is).  Recover the FV cell-average
+        // field from the restored Q1 T via an L2 projection.  Ghost layers are populated
+        // inside l2_project_fe_to_fv, so the result is immediately usable by FCT kernels.
+        fv::hex::l2_project_fe_to_fv(
+            T_fct, T, domains[velocity_level], coords_shell[velocity_level], coords_radii[velocity_level] );
     }
 
     logroot << "Writing initial XDMF ..." << std::endl;
@@ -874,7 +890,15 @@ Result<> run( const Parameters& prm )
         linalg::apply( M, stok_vecs["tmp"].block_1(), stok_vecs["f"].block_1() );
 
         fe::strong_algebraic_homogeneous_velocity_dirichlet_enforcement_stokes_like(
-            stok_vecs["f"], boundary_mask_data[velocity_level], grid::shell::ShellBoundaryFlag::BOUNDARY );
+            stok_vecs["f"],
+            boundary_mask_data[velocity_level],
+            grid::shell::get_shell_boundary_flag( bcs, DIRICHLET ) );
+
+        fe::strong_algebraic_freeslip_enforcement_in_place(
+            stok_vecs["f"],
+            coords_shell[velocity_level],
+            boundary_mask_data[velocity_level],
+            grid::shell::get_shell_boundary_flag( bcs, FREESLIP ) );
 
         logroot << "Solving Stokes ..." << std::endl;
 
@@ -913,78 +937,78 @@ Result<> run( const Parameters& prm )
 
         logroot << "Setting up energy solve ..." << std::endl;
 
-        // Max velocity magnitude.
-        const auto max_vel = kernels::common::max_vector_magnitude( u.block_1().grid_data() );
+        // --- FCT explicit time-stepping ---
+        // Compute the exact stable dt from the actual face-normal velocity fluxes and cell
+        // volumes via a parallel reduce over all cells.  This is more accurate than the
+        // h_min / u_max estimate, which ignores smaller lateral cells near pentagon vertices
+        // of the icosahedral grid and diffusion stiffness on non-orthogonal faces.
+        const auto dt_stable = fv::hex::operators::compute_dt_stable(
+            domains[velocity_level],
+            u.block_1(),
+            fv_cell_centers.grid_data(),
+            coords_shell[velocity_level],
+            coords_radii[velocity_level],
+            prm.physics_parameters.diffusivity );
+        const auto dt = prm.time_stepping_parameters.dt_scaling * dt_stable;
 
-        // Choose "suitable" small dt for accuracy - we have and implicit time-stepping scheme so we do not really need
-        // a CFL in the classical sense. Still useful for time-step size restriction.
-        const auto dt_advection = h / max_vel;
-        // const auto dt_diffusion = ( h * h ) / prm.diffusivity;
-        // const auto dt           = prm.pseudo_cfl * std::min( dt_advection, dt_diffusion );
-        const auto dt = prm.time_stepping_parameters.pseudo_cfl * dt_advection;
+        logroot << "Computing dt (FCT stable) ..." << std::endl;
+        logroot << "    dt_stable:                     " << dt_stable << std::endl;
+        logroot << "=>  dt (= dt_stable * dt_scaling): " << dt << std::endl;
 
-        logroot << "Computing dt ..." << std::endl;
-        logroot << "    max_vel: " << max_vel << std::endl;
-        logroot << "    h:       " << h << std::endl;
-        logroot << "=>  dt:      " << dt << std::endl;
-
-        A.dt()              = dt;
-        A_neumann.dt()      = dt;
-        A_neumann_diag.dt() = dt;
-
-        for ( int i = 0; i < prm.time_stepping_parameters.energy_substeps; i++ )
         {
-            // Prepping for implicit Euler step.
-            linalg::apply( M_T, T, q );
+            util::Timer timer_fct_substeps( "fct_substeps" );
 
-            // Set up the temperature boundary.
-            assign( temp_vecs["tmp_0"], 0.0 );
-            Kokkos::parallel_for(
-                "boundary temp interpolation",
-                local_domain_md_range_policy_nodes( domains[velocity_level] ),
-                InitialConditionInterpolator(
-                    domains[velocity_level].domain_info().radii().front(),
-                    domains[velocity_level].domain_info().radii().back(),
-                    coords_shell[velocity_level],
-                    coords_radii[velocity_level],
-                    temp_vecs["tmp_0"].grid_data(),
-                    boundary_mask_data[velocity_level],
-                    true ) );
-
-            Kokkos::fence();
-
-            fe::strong_algebraic_dirichlet_enforcement_poisson_like(
-                A_neumann,
-                A_neumann_diag,
-                temp_vecs["tmp_0"],
-                temp_vecs["tmp_1"],
-                q,
-                boundary_mask_data[velocity_level],
-                grid::shell::ShellBoundaryFlag::BOUNDARY );
-
-            logroot << "Solving energy ..." << std::endl;
-
-            // Solve energy.
-            solve( energy_solver, A, T, q );
-
-            if ( true )
+            for ( int i = 0; i < prm.time_stepping_parameters.energy_substeps; i++ )
             {
-                table->query_rows_equals( "tag", "energy_fgmres" ).print_pretty();
-            }
-            else
-            {
-                const auto num_energy_iterations =
-                    table->query_rows_equals( "tag", "energy_fgmres" ).column_as_vector< int >( "iteration" ).size();
-                table->query_rows_equals( "tag", "energy_fgmres" )
-                    .query_rows_where(
-                        "iteration",
-                        [num_energy_iterations]( const util::Table::Value& v ) {
-                            return std::get< int >( v ) == 0 || std::get< int >( v ) == num_energy_iterations - 1;
-                        } )
-                    .print_pretty();
+                logroot << "Solving energy (FCT, substep " << i << ") ..." << std::endl;
+
+                {
+                    util::Timer timer_fct_source_step( "fct_explicit_step_updating_source_term" );
+                    if ( prm.physics_parameters.constant_internal_heating )
+                    {
+                        linalg::assign( T_source, prm.physics_parameters.constant_internal_heating_value );
+                    }
+                    timer_fct_source_step.stop();
+
+                    util::Timer timer_fct_step( "fct_explicit_step" );
+                    fv::hex::operators::fct_explicit_step(
+                        domains[velocity_level],
+                        T_fct,
+                        u.block_1(),
+                        fv_cell_centers.grid_data(),
+                        coords_shell[velocity_level],
+                        coords_radii[velocity_level],
+                        dt,
+                        fv_fct_bufs,
+                        prm.physics_parameters.diffusivity,
+                        T_source.grid_data(),
+                        /*subtract_divergence=*/true,
+                        boundary_mask_data[velocity_level],
+                        fct_bcs );
+                    timer_fct_step.stop();
+                }
+
+                // Enforce Dirichlet BCs on T^{n+1} after the full FCT step.
+                fv::hex::apply_dirichlet_bcs(
+                    T_fct, boundary_mask_data[velocity_level], fct_bcs, domains[velocity_level] );
             }
 
-            table->clear();
+            timer_fct_substeps.stop();
+        }
+
+        // Project T_fct → Q1 T once after all substeps.
+        // T is only needed for the Stokes buoyancy RHS and XDMF output; projecting
+        // inside the substep loop would run a mass-matrix CG solve every substep.
+        {
+            util::Timer timer_fct_projection( "fct_l2_projection" );
+            fv::hex::l2_project_fv_to_fe(
+                T,
+                T_fct,
+                domains[velocity_level],
+                coords_shell[velocity_level],
+                coords_radii[velocity_level],
+                l2_proj_tmps );
+            timer_fct_projection.stop();
         }
 
         timer_energy.stop();
